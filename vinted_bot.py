@@ -31,7 +31,7 @@ from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
-from urllib.parse import parse_qs, quote_plus, urlparse
+from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
 
 import discord
 import yaml
@@ -91,13 +91,16 @@ class PricingConfig:
     order: str = "newest_first"
     per_item_sample: int = 96        # tryb per_item: ile ofert pobrać dla tytułu (większość odpada w filtrze trafności)
     per_item_min_sample: int = 8     # tryb per_item: mniej ofert => brak wyceny, brak powiadomienia
-    per_item_max_per_cycle: int = 10 # tryb per_item: limit wycen na wyszukiwanie w jednym cyklu
+    per_item_max_per_cycle: int = 10 # limit nowych wycen (zapytań do sklepów) na wyszukiwanie w jednym cyklu
+    retail_min_shops: int = 2        # cena nowego musi być znaleziona w min. tylu sklepach
+    retail_max_spread: float = 0.5   # max różnica cen między sklepami: (max-min)/min; powyżej – pomijamy
+    use_description: bool = True     # gdy z tytułu nie wynika marka/model, pobierz opis oferty
 
 
 @dataclass
 class SellerConfig:
-    min_rating: float = 4.5
-    min_reviews: int = 5
+    min_rating: float = 4.0
+    min_reviews: int = 3
     cache_ttl_hours: float = 12
 
 
@@ -259,6 +262,7 @@ class Item:
     seller_login: str
     brand: str | None
     details: str | None  # np. "42 · Bardzo dobry" (rozmiar · stan)
+    description: str | None = None  # pobierane osobno (get_item_description)
 
 
 @dataclass
@@ -490,6 +494,16 @@ class VintedClient:
             log.debug("Pominięto ofertę o nieoczekiwanym formacie: %s (%s)", raw.get("id"), e)
             return None
 
+    def get_item_description(self, item_id: int) -> str | None:
+        """⚠️ VINTED-API: szczegóły oferty (opis) – /api/v2/items/{id}. Błąd = brak opisu, bez wyjątku."""
+        try:
+            data = self._get_json(f"/api/v2/items/{item_id}")
+        except VintedError as e:
+            log.debug("Brak opisu oferty %s: %s", item_id, e)
+            return None
+        item = data.get("item") or {}
+        return item.get("description") or None
+
     # ----------------------------------------------------------- sprzedający
     def get_seller(self, user_id: int) -> Seller:
         data = self._get_json(USER_PATH.format(user_id=user_id))
@@ -671,179 +685,54 @@ class Storage:
 
 
 # ============================================================================
-# pricing – wycena rynkowa
+# pricing – rozpoznanie produktu (marka + model) i wycena ze sklepów
 # ============================================================================
-RETAIL_TTL_HOURS = 24   # ceny sklepowe zmieniają się wolno – odpytuj źródło raz na dobę na model
-RETAIL_MIN_SAMPLE = 3   # tyle cen ze sklepów wystarczy do wyceny
+RETAIL_TTL_HOURS = 24   # ceny sklepowe zmieniają się wolno – odpytuj sklepy raz na dobę na model
+
+
+@dataclass
+class ShopQuote:
+    shop: str
+    price: float   # cena w sklepie = mediana pasujących ofert z pierwszej strony wyników
+    title: str     # tytuł przykładowej oferty (najbliższej tej cenie)
+    url: str       # link do oferty (albo do strony wyników, jeśli sklep nie podał linku)
+    offers: int    # ile pasujących ofert w sklepie
 
 
 @dataclass
 class MarketStats:
-    median: float
-    sample_size: int   # ile ofert pobrano
-    used_size: int     # ile zostało po odrzuceniu skrajnych
-    low: float         # dolna granica akceptowanych cen
-    high: float        # górna granica
+    median: float      # cena rynkowa = średnia z cen w sklepach (nazwa pola historyczna)
+    sample_size: int   # ile sklepów
+    used_size: int     # ile sklepów
+    low: float         # najniższa cena ze sklepów
+    high: float        # najwyższa cena ze sklepów
     computed_at: float
-    basis: str = "phrase"  # "phrase" – mediana frazy, "title" – z tytułu oferty (per_item), "retail" – ceny nowych ze sklepów
-    query: str = ""        # dla basis="title"/"retail": zapytanie zbudowane z tytułu
+    basis: str = "retail"
+    query: str = ""
+    quotes: list[ShopQuote] = field(default_factory=list)
 
 
-def robust_median(prices: list[float], iqr_k: float = 1.5) -> tuple[float, list[float], float, float] | None:
-    """Mediana po odrzuceniu wartości spoza [Q1 - k*IQR, Q3 + k*IQR].
+@dataclass(frozen=True)
+class Product:
+    brand: str
+    model: str
 
-    Zwraca (mediana, użyte ceny, dolna granica, górna granica) lub None dla pustej listy.
-    """
-    clean = sorted(p for p in prices if p and p > 0)
-    if not clean:
-        return None
-    if len(clean) < 4:
-        return statistics.median(clean), clean, clean[0], clean[-1]
-    q1, _, q3 = statistics.quantiles(clean, n=4, method="inclusive")
-    iqr = q3 - q1
-    low, high = q1 - iqr_k * iqr, q3 + iqr_k * iqr
-    kept = [p for p in clean if low <= p <= high] or clean
-    return statistics.median(kept), kept, low, high
-
-
-class MarketPricer:
-    def __init__(self, client: VintedClient, cfg: PricingConfig, retail=None, retail_factor: float = 1.0,
-                 retail_only: bool = False):
-        """retail: opcjonalny RetailPriceProvider – zapasowe źródło cen nowych produktów.
-        retail_factor: mnożnik ceny sklepowej (np. 0.7, gdy porównujesz z używanymi).
-        retail_only: wycena wyłącznie z cen sklepowych (bez porównań z ofertami z Vinted)."""
-        self.client = client
-        self.cfg = cfg
-        self.retail = retail
-        self.retail_factor = retail_factor
-        self.retail_only = retail_only
-        self._cache: dict[str, MarketStats | None] = {}
-        self._cache_ts: dict[str, float] = {}
-
-    def _cached(self, search: SearchConfig) -> tuple[str, bool, MarketStats | None]:
-        key = self._cache_key(search)
-        fresh = key in self._cache and time.time() - self._cache_ts[key] < self.cfg.cache_ttl_minutes * 60
-        return key, fresh, self._cache.get(key) if fresh else None
-
-    def _store(self, key: str, stats: MarketStats | None) -> None:
-        self._cache[key] = stats
-        self._cache_ts[key] = time.time()
-
-    def get_stats(self, search: SearchConfig) -> MarketStats | None:
-        """Mediana dla frazy (z cache). None = za mała próbka, nie da się ocenić okazji."""
-        key, fresh, cached = self._cached(search)
-        if fresh:
-            return cached
-
-        # Próbka BEZ filtra price_max – inaczej mediana byłaby sztucznie zaniżona.
-        items = self.client.search(search, limit=self.cfg.sample_size, order=self.cfg.order, with_price_filter=False)
-        stats = self._compute([i.price for i in items], self.cfg.min_sample)
-        self._store(key, stats)
-
-        if stats is None:
-            log.warning("[%s] za mało ofert do wyceny (%d < %d) – frazę pomijam do kolejnego przeliczenia",
-                        search.name, len(items), self.cfg.min_sample)
-        else:
-            log.info("[%s] mediana rynkowa %.2f (próbka %d, po odrzuceniu skrajnych %d, zakres %.2f–%.2f)",
-                     search.name, stats.median, stats.sample_size, stats.used_size, stats.low, stats.high)
-        return stats
-
-    def is_item_cached(self, search: SearchConfig, item: Item) -> bool:
-        """True = wycena tej oferty nie wymaga nowych zapytań (limit per_item_max_per_cycle)."""
-        query = title_query(item.title)
-        if not query:
-            return True  # nie ma czego wyceniać, zapytanie nie poleci
-        if self.retail_only:
-            key = "retail:" + query
-            return key in self._cache and time.time() - self._cache_ts[key] < RETAIL_TTL_HOURS * 3600
-        _, fresh, cached = self._cached(item_search(search, query))
-        return fresh
-
-    def get_item_stats(self, search: SearchConfig, item: Item) -> MarketStats | None:
-        """Najpierw mediana podobnych ofert z Vinted; gdy ich brakuje – cena nowego produktu
-        ze źródła sklepowego (jeśli skonfigurowane). None = nie da się wycenić (oferta pomijana)."""
-        query = title_query(item.title)
-        if not query:
-            return None
-        if self.retail_only:
-            return self._retail_stats(query) if self.retail is not None else None
-        stats = self._vinted_item_stats(search, item, query)
-        if stats is None and self.retail is not None:
-            stats = self._retail_stats(query)
-        return stats
-
-    def _vinted_item_stats(self, search: SearchConfig, item: Item, query: str) -> MarketStats | None:
-        """Mediana z wyszukiwania po tytule oferty, w tej samej kategorii/marce/stanie.
-        Wycena przybliżona – tytuły bywają ogólnikowe albo w innym języku."""
-        derived = item_search(search, query)
-        key, fresh, cached = self._cached(derived)
-        if fresh:
-            return cached
-        # relevance: przy konkretnym modelu daje więcej trafnych wyników niż newest_first.
-        items = self.client.search(derived, limit=self.cfg.per_item_sample, order="relevance",
-                                   with_price_filter=False)
-        # Wyszukiwarka Vinted jest luźna (etui, końcówki, inne modele) – zostaw tylko oferty,
-        # których tytuł pasuje do zapytania. Bez tego mediana jest przypadkowa.
-        matched = [i.price for i in items if i.id != item.id and title_matches(query, i.title)]
-        stats = self._compute(matched, self.cfg.per_item_min_sample)
-        if stats is not None:
-            stats.basis, stats.query = "title", query
-        self._store(key, stats)
-        log.debug("[%s] mediana dla „%s”: %s", search.name, query,
-                  f"{stats.median:.2f} (pasujących {len(matched)}/{len(items)})" if stats
-                  else f"brak – pasujących ofert {len(matched)}/{len(items)} (min {self.cfg.per_item_min_sample})")
-        return stats
-
-    def _retail_stats(self, query: str) -> MarketStats | None:
-        """Cena nowego produktu ze źródła sklepowego (cache RETAIL_TTL_HOURS, także negatywny)."""
-        key = "retail:" + query
-        if key in self._cache and time.time() - self._cache_ts[key] < RETAIL_TTL_HOURS * 3600:
-            return self._cache[key]
-        try:
-            prices = self.retail.lookup(query)
-        except Exception as e:  # noqa: BLE001 – awaria źródła nie może zatrzymać bota; nie cache'ujemy błędu
-            log.warning("Źródło cen sklepowych nie odpowiedziało dla „%s”: %s", query, e)
-            return None
-        stats = self._compute([p * self.retail_factor for p in prices], RETAIL_MIN_SAMPLE)
-        if stats is not None:
-            stats.basis, stats.query = "retail", query
-        self._store(key, stats)
-        log.debug("Ceny sklepowe dla „%s”: %s", query,
-                  f"mediana {stats.median:.2f} (n={stats.used_size})" if stats else f"brak ({len(prices)} cen)")
-        return stats
-
-    @staticmethod
-    def _cache_key(search: SearchConfig) -> str:
-        """Nazwa + filtry wpływające na próbkę – usunięcie i ponowne dodanie wyszukiwania
-        o tej samej nazwie, ale innych filtrach, nie użyje starej mediany."""
-        data = dataclasses.asdict(search)
-        for k in ("price_max", "price_min", "deal_threshold", "mode", "channel_id", "source"):
-            data.pop(k)
-        return json.dumps(data, sort_keys=True)
-
-    def _compute(self, prices: list[float], min_sample: int) -> MarketStats | None:
-        result = robust_median(prices, self.cfg.iqr_k)
-        if result is None:
-            return None
-        median, kept, low, high = result
-        if len(kept) < min_sample:
-            return None
-        return MarketStats(median=median, sample_size=len(prices), used_size=len(kept),
-                           low=low, high=high, computed_at=time.time())
+    @property
+    def query(self) -> str:
+        return f"{self.brand} {self.model}".strip()
 
 
 def discount(price: float, median: float) -> float:
-    """Ułamek, o ile oferta jest tańsza od mediany (0.3 = 30% taniej)."""
+    """Ułamek, o ile oferta jest tańsza od ceny rynkowej (0.3 = 30% taniej)."""
     return 1 - price / median if median > 0 else 0.0
 
 
-# Słowa, które nic nie mówią o produkcie – wycinane z tytułu przed wyszukiwaniem (PL + częste z innych krajów).
+# Słowa, które nic nie mówią o produkcie (PL + częste z innych krajów).
 _STOPWORDS = {
     "nowy", "nowa", "nowe", "nowka", "nówka", "new", "nou", "noua", "nouă", "neu", "neue", "nuevo", "nuovo", "uj", "új",
     "nový", "nova", "sprzedam", "okazja", "tanio", "oryginalny", "oryginalna", "oryginalne", "original", "originál",
     "metka", "metką", "metki", "tag", "tags", "tagged", "with", "bez", "brand", "sealed", "folia", "zafoliowany",
     "z", "i", "w", "na", "do", "dla", "and", "the", "for", "a", "de", "cu", "si", "și", "und", "mit", "es", "és",
-    # Kolory i opisy stanu – nie określają modelu, a zawężają zapytanie (mniej porównywalnych ofert).
     "czarny", "czarna", "czarne", "biały", "biała", "białe", "szary", "szara", "szare", "srebrny", "srebrna",
     "srebrne", "złote", "niebieskie", "czerwone", "zielone", "różowe", "złoty", "złota", "niebieski", "niebieska", "czerwony", "czerwona", "zielony", "zielona", "różowy", "różowa",
     "black", "white", "grey", "gray", "silver", "gold", "blue", "red", "green", "pink",
@@ -851,24 +740,102 @@ _STOPWORDS = {
     "dobrym", "komplet", "kompletny", "gwarancja", "gwarancją", "paragon", "faktura", "sprawny", "sprawna",
     "sprawne", "polecam", "super", "ładny", "ładna", "jak", "nowego", "od", "po", "oraz", "lub",
 }
-_TITLE_WORDS = 5
+# Nazwy rodzajów produktów – same w sobie nie są modelem.
+_GENERIC = {
+    "słuchawki", "sluchawki", "głośnik", "glosnik", "lokówka", "lokowka", "prostownica", "suszarka", "golarka",
+    "maszynka", "trymer", "odkurzacz", "ekspres", "blender", "mikser", "robot", "telefon", "smartfon", "smartphone",
+    "laptop", "notebook", "tablet", "konsola", "kamera", "aparat", "zegarek", "smartwatch", "opaska", "monitor",
+    "klawiatura", "mysz", "router", "powerbank", "telewizor", "tv", "soundbar", "bezprzewodowe", "bezprzewodowy",
+    "bezprzewodowa", "bluetooth", "wireless", "headphones", "speaker", "phone", "earbuds", "douszne", "nauszne",
+    "gaming", "gamingowy", "gamingowa", "elektryczna", "elektryczny", "profesjonalna", "profesjonalny", "model",
+}
+# Modele bez cyfry w nazwie, które i tak jednoznacznie identyfikują produkt – dopisuj własne.
+KNOWN_MODEL_WORDS = {"airwrap", "supersonic", "corrale", "airstrait", "airpods", "kindle", "roomba", "switch"}
+# Marki rozpoznawane w tytule/opisie, gdy Vinted nie podaje marki – dopisuj własne.
+KNOWN_BRANDS = {
+    "apple", "samsung", "xiaomi", "sony", "jbl", "bose", "philips", "dyson", "huawei", "oppo", "realme", "oneplus",
+    "google", "lg", "panasonic", "braun", "remington", "babyliss", "ghd", "rowenta", "tefal", "bosch", "siemens",
+    "zelmer", "jabra", "sennheiser", "beats", "marshall", "anker", "soundcore", "logitech", "razer", "hyperx",
+    "steelseries", "asus", "acer", "lenovo", "hp", "dell", "msi", "nintendo", "microsoft", "garmin", "fitbit",
+    "amazfit", "polar", "gopro", "dji", "canon", "nikon", "fujifilm", "amazon", "tp-link", "netgear", "epson",
+    "brother", "hisense", "tcl", "harman", "motorola", "nokia", "poco", "honor", "nothing", "shark", "karcher",
+    "irobot", "roborock", "dreame", "ecovacs", "nespresso", "delonghi", "krups", "kenwood", "wahl", "moser",
+    "andis", "cecotec", "oral-b", "sandisk", "kingston", "corsair", "playstation", "xbox",
+}
+_NO_BRAND = {"inne", "inna", "inny", "other", "brak", "none", "no brand", "nieznana", "bez marki", "unbranded"}
+_MODEL_SUFFIXES = {"pro", "max", "plus", "ultra", "mini", "lite", "se", "fe", "xl", "air", "neo", "gt", "turbo"}
+_WORD_RE = re.compile(r"[\w][\w\-]*")
+_UNIT_RE = re.compile(r"^\d+(?:[.,]\d+)?(?:gb|tb|mb|cm|mm|ml|mah|hz|w|v|kg|g|m|l|k|szt|zl|zł|pln|eur|cali|cal|inch)$")
 
 
-def title_query(title: str) -> str:
-    """'Słuchawki Sony WH-1000XM5 NOWE z metką!' -> 'słuchawki sony wh-1000xm5'"""
-    words = re.findall(r"[\w][\w\-]*", title.lower())
-    kept = [w for w in words if w not in _STOPWORDS and (len(w) > 1 or w.isdigit())]
-    return " ".join(kept[:_TITLE_WORDS])
+def _words(text: str) -> list[str]:
+    return _WORD_RE.findall(text.lower())
+
+
+def _find_known_brand(text: str | None) -> str | None:
+    if not text:
+        return None
+    padded = " " + " ".join(_words(text)) + " "
+    for brand in KNOWN_BRANDS:
+        if f" {brand} " in padded:
+            return brand
+    return None
+
+
+def _model_from(text: str, brand_words: set[str]) -> str | None:
+    """Model = pierwszy człon z cyfrą (xm5, s23, 15, 7) + ewentualny poprzedni wyraz (flip 7)
+    + przyrostki (pro, max…). Bez cyfry – tylko modele z KNOWN_MODEL_WORDS. Inaczej None (nie zgadujemy)."""
+    words = [w for w in _words(text)
+             if w not in brand_words and w not in _STOPWORDS and w not in _GENERIC and (len(w) > 1 or w.isdigit())]
+    for i, w in enumerate(words):
+        if not any(ch.isdigit() for ch in w) or _UNIT_RE.match(w):
+            continue
+        if w.isdigit() and (len(w) > 4 or 1900 <= int(w) <= 2100):  # numer, rok – nie model
+            continue
+        parts = [words[i - 1]] if w.isdigit() and i > 0 else []
+        parts.append(w)
+        for nxt in words[i + 1:i + 3]:
+            if nxt not in _MODEL_SUFFIXES:
+                break
+            parts.append(nxt)
+        return " ".join(parts)
+    for w in words:
+        if w in KNOWN_MODEL_WORDS:
+            return w
+    return None
+
+
+def _identify(brand_hint: str | None, title: str, description: str | None = None) -> Product | None:
+    if brand_hint and brand_hint.strip().lower() not in _NO_BRAND:
+        brand = brand_hint.strip().lower()
+    else:
+        brand = _find_known_brand(title) or _find_known_brand(description)
+    if not brand:
+        return None
+    brand_words = set(_words(brand))
+    model = _model_from(title, brand_words)
+    if model is None and description:
+        model = _model_from(description[:500], brand_words)
+    return Product(brand, model) if model else None
+
+
+def identify_product(item: Item, description: str | None = None) -> Product | None:
+    """Marka + model z tytułu (a gdy się nie da – z opisu). None = nie da się ustalić, oferta pomijana."""
+    return _identify(item.brand, item.title, description)
+
+
+def identify_text(text: str) -> Product | None:
+    return _identify(None, text)
 
 
 def _norm_tokens(text: str) -> list[str]:
-    """Małe litery, bez polskich/obcych znaków diakrytycznych: 'Głośnik JBL Flip-7' -> ['glosnik','jbl','flip','7']"""
+    """Małe litery, bez znaków diakrytycznych: 'Głośnik JBL Flip-7' -> ['glosnik','jbl','flip','7']"""
     text = unicodedata.normalize("NFKD", text.lower().replace("ł", "l"))
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
     return re.findall(r"[a-z0-9]+", text)
 
 
-# Akcesoria i części – psują medianę urządzenia (po normalizacji, bez polskich znaków).
+# Akcesoria i części – psują cenę urządzenia (po normalizacji, bez polskich znaków).
 _ACCESSORY_WORDS = {
     "etui", "case", "cover", "pokrowiec", "obudowa", "folia", "szklo", "szybka", "ochronne", "protector",
     "ladowarka", "charger", "kabel", "cable", "przewod", "adapter", "przejsciowka", "uchwyt", "stojak", "holder",
@@ -902,18 +869,73 @@ def title_matches(query: str, title: str, min_ratio: float = 0.7) -> bool:
     return hits >= max(1, round(min_ratio * len(q)))
 
 
-def item_search(search: SearchConfig, query: str) -> SearchConfig:
-    """Wyszukiwanie do wyceny jednej oferty: jej tytuł + kategoria/marka/stan z wyszukiwania.
-    Rozmiar i ceny pomijamy – zawężałyby próbkę bez wpływu na wartość przedmiotu."""
-    return dataclasses.replace(search, query=query, size_ids=[], price_min=None, price_max=None)
+def brand_in_title(brand: str, title: str) -> bool:
+    b = _norm_tokens(brand)
+    if not b:
+        return False
+    t = _norm_tokens(title)
+    tokens, compact = set(t), "".join(t)
+    return all(w in tokens or (len(w) >= 3 and w in compact) for w in b)
+
+
+def evaluate_quotes(product: Product, quotes: list[ShopQuote], min_shops: int = 2, max_spread: float = 0.5,
+                    factor: float = 1.0) -> tuple[MarketStats | None, str]:
+    """Reguły: ceny w ≥ min_shops sklepach i rozrzut (max-min)/min ≤ max_spread; wynik = średnia cen."""
+    if len(quotes) < min_shops:
+        return None, f"ceny tylko w {len(quotes)} sklepach (min {min_shops})"
+    prices = [q.price for q in quotes]
+    lo, hi = min(prices), max(prices)
+    spread = (hi - lo) / lo
+    if spread > max_spread:
+        return None, f"ceny w sklepach różnią się o {spread * 100:.0f}% (max {max_spread * 100:.0f}%)"
+    stats = MarketStats(median=statistics.mean(prices) * factor, sample_size=len(quotes), used_size=len(quotes),
+                        low=lo, high=hi, computed_at=time.time(), basis="retail", query=product.query,
+                        quotes=quotes)
+    return stats, "ok"
+
+
+class MarketPricer:
+    """Cena rynkowa nowego produktu ze sklepów (cache RETAIL_TTL_HOURS, także wyniki odrzucone)."""
+
+    def __init__(self, cfg: PricingConfig, retail: "RetailPriceProvider | None" = None, retail_factor: float = 1.0):
+        self.cfg = cfg
+        self.retail = retail
+        self.retail_factor = retail_factor
+        self._cache: dict[str, tuple[float, MarketStats | None]] = {}
+
+    def is_cached(self, product: Product) -> bool:
+        """True = wycena nie wymaga nowych zapytań do sklepów (limit per_item_max_per_cycle)."""
+        hit = self._cache.get(product.query)
+        return hit is not None and time.time() - hit[0] < RETAIL_TTL_HOURS * 3600
+
+    def get_stats(self, product: Product) -> MarketStats | None:
+        hit = self._cache.get(product.query)
+        if hit is not None and time.time() - hit[0] < RETAIL_TTL_HOURS * 3600:
+            return hit[1]
+        if self.retail is None:
+            return None
+        try:
+            quotes = self.retail.lookup(product)
+        except Exception as e:  # noqa: BLE001 – awaria źródła nie zatrzymuje bota; błędu nie cache'ujemy
+            log.warning("Źródło cen sklepowych nie odpowiedziało dla „%s”: %s", product.query, e)
+            return None
+        stats, reason = evaluate_quotes(product, quotes, self.cfg.retail_min_shops, self.cfg.retail_max_spread,
+                                        self.retail_factor)
+        self._cache[product.query] = (time.time(), stats)
+        if stats is None:
+            log.info("Pomijam „%s”: %s", product.query, reason)
+        else:
+            log.info("Cena rynkowa „%s”: %.2f (sklepy: %s)", product.query, stats.median,
+                     ", ".join(f"{q.shop} {q.price:.0f}" for q in quotes))
+        return stats
 
 
 # ============================================================================
-# shops – ceny nowych produktów ze stron sklepów
+# shops – ceny nowych produktów ze stron wyników sklepów
 # ============================================================================
 # ⚠️ NIEZWERYFIKOWANE NA ŻYWYCH STRONACH: adresy wyszukiwarek i sposób wyciągania cen to
 # najlepsze przybliżenie. Po wdrożeniu uruchom:
-#     python vinted_bot.py --retail-check "jbl flip 7" --save
+#     python vinted_bot.py --retail-check "sony wh-1000xm5" --save
 # Jeśli sklep zwraca 0 ofert, ustaw dla niego selektory CSS (item_sel / title_sel / price_sel).
 @dataclass(frozen=True)
 class Shop:
@@ -926,12 +948,13 @@ class Shop:
 
 SHOPS: dict[str, Shop] = {s.name: s for s in (
     Shop("ceneo", "https://www.ceneo.pl/;szukaj-{q}"),
-    Shop("xkom", "https://www.x-kom.pl/szukaj?q={q}"),
-    Shop("morele", "https://www.morele.net/wyszukiwarka/?q={q}"),
-    Shop("mediaexpert", "https://www.mediaexpert.pl/search?query[querystring]={q}"),
     Shop("euro", "https://www.euro.com.pl/search.bhtml?keyword={q}"),
+    Shop("morele", "https://www.morele.net/wyszukiwarka/?q={q}"),
+    Shop("xkom", "https://www.x-kom.pl/szukaj?q={q}"),
+    Shop("skapiec", "https://www.skapiec.pl/szukaj?q={q}"),
+    Shop("mediaexpert", "https://www.mediaexpert.pl/search?query[querystring]={q}"),
 )}
-DEFAULT_SHOPS = ("ceneo", "xkom", "morele")
+DEFAULT_SHOPS = ("ceneo", "euro", "morele", "xkom", "skapiec")
 
 _PRICE_RE = re.compile(r"\d[\d\s\u00a0\u202f.,]*\d|\d")
 
@@ -970,35 +993,36 @@ def _offer_price(offers) -> float | None:
     return None
 
 
-def _walk(node, out: list[tuple[str, float]]) -> None:
+def _walk(node, out: list[tuple[str, float, str]], page_url: str) -> None:
     if isinstance(node, list):
         for n in node:
-            _walk(n, out)
+            _walk(n, out, page_url)
     elif isinstance(node, dict):
         t = node.get("@type")
         if "Product" in (t if isinstance(t, list) else [t]) and node.get("name"):
             price = _offer_price(node.get("offers"))
             if price:
-                out.append((str(node["name"]), price))
+                url = node.get("url")
+                out.append((str(node["name"]), price, urljoin(page_url, url) if isinstance(url, str) and url else page_url))
         for key, value in node.items():
             if key != "offers":
-                _walk(value, out)
+                _walk(value, out, page_url)
 
 
 _JSONLD_RE = re.compile(r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', re.S | re.I)
 
 
-def extract_jsonld(html: str) -> list[tuple[str, float]]:
-    out: list[tuple[str, float]] = []
+def extract_jsonld(html: str, page_url: str) -> list[tuple[str, float, str]]:
+    out: list[tuple[str, float, str]] = []
     for m in _JSONLD_RE.finditer(html):
         try:
-            _walk(json.loads(m.group(1)), out)
+            _walk(json.loads(m.group(1)), out, page_url)
         except ValueError:
             continue
     return list(dict.fromkeys(out))  # bez duplikatów, z zachowaniem kolejności
 
 
-def extract_selectors(html: str, shop: Shop) -> list[tuple[str, float]]:
+def extract_selectors(html: str, shop: Shop, page_url: str) -> list[tuple[str, float, str]]:
     if not (shop.item_sel and shop.title_sel and shop.price_sel):
         return []
     try:
@@ -1007,20 +1031,23 @@ def extract_selectors(html: str, shop: Shop) -> list[tuple[str, float]]:
         log.warning("Sklep %s ma selektory CSS, ale brak biblioteki: pip install beautifulsoup4", shop.name)
         return []
     soup = BeautifulSoup(html, "html.parser")
-    out: list[tuple[str, float]] = []
+    out: list[tuple[str, float, str]] = []
     for card in soup.select(shop.item_sel):
         title_el, price_el = card.select_one(shop.title_sel), card.select_one(shop.price_sel)
         if title_el is None or price_el is None:
             continue
         price = parse_price(price_el.get_text(" ", strip=True))
-        if price:
-            out.append((title_el.get_text(" ", strip=True), price))
+        if not price:
+            continue
+        link_el = title_el if title_el.name == "a" and title_el.get("href") else card.select_one("a[href]")
+        url = urljoin(page_url, link_el["href"]) if link_el is not None else page_url
+        out.append((title_el.get_text(" ", strip=True), price, url))
     return out
 
 
-def extract_items(html: str, shop: Shop) -> list[tuple[str, float]]:
-    """(tytuł, cena) ze strony wyników: selektory (jeśli ustawione), w razie braku wyników – JSON-LD."""
-    return extract_selectors(html, shop) or extract_jsonld(html)
+def extract_items(html: str, shop: Shop, page_url: str) -> list[tuple[str, float, str]]:
+    """(tytuł, cena, link) ze strony wyników: selektory (jeśli ustawione), w razie braku – JSON-LD."""
+    return extract_selectors(html, shop, page_url) or extract_jsonld(html, page_url)
 
 
 class ShopFetcher:
@@ -1038,54 +1065,43 @@ class ShopFetcher:
             self._session.headers.update({"Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7"})
         return self._session
 
+    @staticmethod
+    def page_url(shop: Shop, query: str) -> str:
+        return shop.search_url.format(q=quote_plus(query))
+
     def get(self, shop: Shop, query: str) -> tuple[int, str]:
-        url = shop.search_url.format(q=quote_plus(query))
-        r = self._get_session().get(url)
+        r = self._get_session().get(self.page_url(shop, query))
         return r.status_code, r.text
 
-    def fetch_items(self, shop: Shop, query: str) -> list[tuple[str, float]]:
+    def fetch_items(self, shop: Shop, query: str) -> list[tuple[str, float, str]]:
         status, html = self.get(shop, query)
         if status >= 400:
             raise RuntimeError(f"HTTP {status}")
-        return extract_items(html, shop)
+        return extract_items(html, shop, self.page_url(shop, query))
 
 
 # ============================================================================
-# retail_pricing – źródła cen nowych produktów
+# retail_pricing – źródło cen nowych produktów (sklepy)
 # ============================================================================
 class RetailPriceProvider(Protocol):
-    def lookup(self, query: str) -> list[float]: ...
+    def lookup(self, product: Product) -> list[ShopQuote]: ...
 
 
-def _tokens(text: str) -> set[str]:
-    text = unicodedata.normalize("NFKD", text.lower().replace("ł", "l"))
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    return set(re.findall(r"[a-z0-9]+", text))
-
-
-class JsonFileProvider:
-    """Ceny z pliku JSON: {"jbl flip 7": [449, 459, 499], "sony wh-1000xm5": [1099, 1199]}.
-
-    Zapytanie z tytułu oferty pasuje do wpisu, gdy zawiera wszystkie jego słowa.
-    Przy kilku trafieniach wygrywa najdłuższy wpis. Plik jest czytany przy każdym lookup().
-    """
-
-    def __init__(self, path: str):
-        self.path = Path(path)
-
-    def lookup(self, query: str) -> list[float]:
-        data = json.loads(self.path.read_text(encoding="utf-8"))
-        q = _tokens(query)
-        best: tuple[int, list[float]] | None = None
-        for name, prices in data.items():
-            words = _tokens(name)
-            if words and words <= q and (best is None or len(words) > best[0]):
-                best = (len(words), [float(p) for p in prices])
-        return best[1] if best else []
+def _shop_quote(shop_name: str, product: Product, found: list[tuple[str, float, str]],
+                per_shop: int) -> ShopQuote | None:
+    """Z wyników sklepu zostawia oferty tego samego produktu (marka + model, bez akcesoriów);
+    cena sklepu = mediana z pierwszych `per_shop` pasujących."""
+    matched = [(t, p, u) for t, p, u in found
+               if brand_in_title(product.brand, t) and title_matches(product.query, t)][:per_shop]
+    if not matched:
+        return None
+    med = statistics.median(p for _, p, _ in matched)
+    title, _, url = min(matched, key=lambda m: abs(m[1] - med))
+    return ShopQuote(shop_name, med, title, url, len(matched))
 
 
 class ShopPriceProvider:
-    """Ceny nowego produktu ze stron wyników kilku sklepów (awaria jednego nie przerywa reszty)."""
+    """Ceny nowego produktu ze stron wyników kilku sklepów. Awaria jednego sklepu nie przerywa reszty."""
 
     def __init__(self, shop_names: list[str], per_shop: int = 5, delay: tuple[float, float] = (1.0, 2.5)):
         unknown = [n for n in shop_names if n not in SHOPS]
@@ -1096,43 +1112,30 @@ class ShopPriceProvider:
         self.delay = delay
         self.fetcher = ShopFetcher()
 
-    def lookup(self, query: str) -> list[float]:
-        prices: list[float] = []
+    def lookup(self, product: Product) -> list[ShopQuote]:
+        quotes: list[ShopQuote] = []
         for idx, shop in enumerate(self.shops):
             if idx:
                 time.sleep(random.uniform(*self.delay))
             try:
-                found = self.fetcher.fetch_items(shop, query)
+                found = self.fetcher.fetch_items(shop, product.query)
             except Exception as e:  # noqa: BLE001 – blokada/zmiana HTML jednego sklepu nie zatrzymuje reszty
-                log.warning("[%s] nie udało się pobrać cen dla „%s”: %s", shop.name, query, e)
+                log.warning("[%s] nie udało się pobrać cen dla „%s”: %s", shop.name, product.query, e)
                 continue
-            matched = [p for title, p in found if title_matches(query, title)][: self.per_shop]
-            log.debug("[%s] „%s”: ofert %d, pasujących %d %s", shop.name, query, len(found), len(matched), matched)
-            prices += matched
-        return prices
-
-
-class ChainProvider:
-    """Pierwszy provider, który zwróci jakieś ceny (np. ręczny plik, potem sklepy)."""
-
-    def __init__(self, providers: list[RetailPriceProvider]):
-        self.providers = providers
-
-    def lookup(self, query: str) -> list[float]:
-        for provider in self.providers:
-            prices = provider.lookup(query)
-            if prices:
-                return prices
-        return []
+            quote = _shop_quote(shop.name, product, found, self.per_shop)
+            log.debug("[%s] „%s”: ofert %d, cena %s", shop.name, product.query, len(found),
+                      f"{quote.price:.2f} (n={quote.offers})" if quote else "brak")
+            if quote:
+                quotes.append(quote)
+        return quotes
 
 
 def build_provider_from_env() -> tuple[RetailPriceProvider | None, float]:
     """Zwraca (provider albo None, mnożnik ceny). Konfiguracja przez zmienne środowiskowe (.env):
 
-      RETAIL_SHOPS=ceneo,xkom,morele   – sklepy do porównania ("off" wyłącza)
-                                         dostępne: ceneo, xkom, morele, mediaexpert, euro
-      RETAIL_PRICES_FILE=data/retail_prices.json – ręczne ceny, sprawdzane PRZED sklepami (opcjonalne)
-      RETAIL_FACTOR=1.0                – mnożnik ceny sklepowej
+      RETAIL_SHOPS=ceneo,euro,morele,xkom,skapiec – sklepy do porównania ("off" wyłącza)
+                                                    dostępne: ceneo, euro, morele, xkom, skapiec, mediaexpert
+      RETAIL_FACTOR=1.0                – mnożnik średniej ceny sklepowej (np. 0.95)
       RETAIL_PROXY=...                 – proxy dla zapytań do sklepów (opcjonalne)
     """
     try:
@@ -1140,33 +1143,32 @@ def build_provider_from_env() -> tuple[RetailPriceProvider | None, float]:
     except ValueError:
         log.warning("RETAIL_FACTOR nie jest liczbą – używam 1.0")
         factor = 1.0
-    providers: list[RetailPriceProvider] = []
-    path = os.environ.get("RETAIL_PRICES_FILE")
-    if path:
-        providers.append(JsonFileProvider(path))
     shops_env = os.environ.get("RETAIL_SHOPS", ",".join(DEFAULT_SHOPS)).strip()
-    if shops_env.lower() not in ("off", "none", ""):
-        providers.append(ShopPriceProvider([s.strip() for s in shops_env.split(",") if s.strip()]))
-    if not providers:
+    if shops_env.lower() in ("off", "none", ""):
         return None, factor
-    log.info("Ceny rynkowe: %s (mnożnik %.2f)", " → ".join(type(p).__name__ for p in providers), factor)
-    return ChainProvider(providers), factor
+    names = [s.strip() for s in shops_env.split(",") if s.strip()]
+    log.info("Ceny rynkowe ze sklepów: %s (mnożnik %.2f)", ", ".join(names), factor)
+    return ShopPriceProvider(names), factor
 
 
 # ============================================================================
 # retail_check – diagnostyka cen sklepowych (--retail-check)
 # ============================================================================
 def retail_check(query_arg: str, shops_arg: str, save: bool) -> int:
-    query = title_query(query_arg) or query_arg
-    print(f"Zapytanie: „{query}”\n")
-    fetcher, all_prices = ShopFetcher(), []
+    product = identify_text(query_arg)
+    if product is None:
+        print(f"Nie rozpoznano marki i modelu w „{query_arg}” – bot pominąłby taką ofertę.\n"
+              "Podaj np. 'sony wh-1000xm5' (marka z listy KNOWN_BRANDS + model z cyfrą).")
+        return 1
+    print(f"Marka: {product.brand} | model: {product.model} | zapytanie: „{product.query}”\n")
+    fetcher, quotes = ShopFetcher(), []
     for name in (n.strip() for n in shops_arg.split(",") if n.strip()):
         shop = SHOPS.get(name)
         if shop is None:
             print(f"[{name}] nieznany sklep (dostępne: {', '.join(SHOPS)})")
             continue
         try:
-            status, html = fetcher.get(shop, query)
+            status, html = fetcher.get(shop, product.query)
         except Exception as e:  # noqa: BLE001
             print(f"[{name}] błąd połączenia: {e}")
             continue
@@ -1174,22 +1176,26 @@ def retail_check(query_arg: str, shops_arg: str, save: bool) -> int:
             out = Path("data") / f"retail_debug_{name}.html"
             out.parent.mkdir(exist_ok=True)
             out.write_text(html, encoding="utf-8")
-        items = extract_items(html, shop) if status < 400 else []
-        matched = [(t, p) for t, p in items if title_matches(query, t)]
-        print(f"[{name}] HTTP {status}, {len(html)//1024} KB, ofert znalezionych: {len(items)}, pasujących: {len(matched)}")
-        for t, p in matched[:5]:
-            print(f"      {p:>9.2f}  {t[:70]}")
-        if status < 400 and not items:
+        page_url = fetcher.page_url(shop, product.query)
+        found = extract_items(html, shop, page_url) if status < 400 else []
+        quote = _shop_quote(name, product, found, 5)
+        print(f"[{name}] HTTP {status}, {len(html) // 1024} KB, ofert znalezionych: {len(found)}, "
+              f"cena sklepu: {f'{quote.price:.2f} (n={quote.offers})' if quote else 'brak'}")
+        if quote:
+            print(f"      {quote.title[:70]}\n      {quote.url}")
+            quotes.append(quote)
+        if status < 400 and not found:
             print("      → 0 ofert: strona bez JSON-LD albo zablokowana. Ustaw selektory CSS w SHOPS "
                   "(uruchom z --save i obejrzyj zapisany HTML).")
-        all_prices += [p for _, p in matched[:5]]
 
-    result = robust_median(all_prices)
     print()
-    if result:
-        print(f"Mediana z {len(all_prices)} cen: {result[0]:.2f} (po odrzuceniu skrajnych: {len(result[1])})")
+    defaults = PricingConfig()
+    stats, reason = evaluate_quotes(product, quotes, defaults.retail_min_shops, defaults.retail_max_spread)
+    if stats:
+        print(f"Cena rynkowa: {stats.median:.2f} (średnia z {len(quotes)} sklepów, rozrzut "
+              f"{(stats.high - stats.low) / stats.low * 100:.0f}%)")
     else:
-        print("Brak cen do wyceny.")
+        print(f"Bot pominąłby ten produkt: {reason}")
     return 0
 
 
@@ -1272,10 +1278,8 @@ def describe(search: SearchConfig, default_threshold: float | None = None) -> st
         parts.append(f"≥ {search.price_min:g}")
     if search.price_max is not None:
         parts.append(f"≤ {search.price_max:g}")
-    mode = search.effective_mode
-    parts.append(f"tryb: {MODE_LABELS[mode]}")
     threshold = search.deal_threshold or default_threshold
-    if threshold and mode != "all":
+    if threshold:
         parts.append(f"próg {threshold * 100:.0f}%" + ("" if search.deal_threshold else " (domyślny)"))
     return " · ".join(parts)
 
@@ -1438,11 +1442,16 @@ def _md(text: str) -> str:
 
 
 def _median_label(stats: MarketStats) -> str:
-    if stats.basis == "retail":
-        return f"🏬 Cena nowego (sklepy, n={stats.used_size})"
-    if stats.basis == "title":
-        return f"📊 Mediana podobnych (≈, n={stats.used_size})"
-    return "📊 Mediana"
+    return f"🏬 Średnia cena nowego ({stats.used_size} sklepy)"
+
+
+def _sources_text(stats: MarketStats, currency: str) -> str:
+    """Lista źródeł cen jako linki markdown: [sklep](url) — cena."""
+    lines = []
+    for q in stats.quotes:
+        url = q.url.replace("(", "%28").replace(")", "%29")
+        lines.append(f"• [{q.shop}]({url}) — **{q.price:.2f} {currency}**")
+    return "\n".join(lines)
 
 
 def build_discord_embed(item: Item, stats: MarketStats | None, seller: Seller, search_name: str) -> dict:
@@ -1474,6 +1483,8 @@ def build_discord_embed(item: Item, stats: MarketStats | None, seller: Seller, s
         "footer": {"text": footer[:2048]},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if stats is not None and stats.quotes:
+        embed["description"] = ("**🛒 Skąd ceny nowego produktu:**\n" + _sources_text(stats, item.currency))[:4096]
     if item.photo_url:
         embed["image"] = {"url": item.photo_url}
     return embed
@@ -1491,9 +1502,11 @@ def format_deal_text(item: Item, stats: MarketStats | None, seller: Seller, sear
                       f"  📉 {pct:.0f}% taniej")
     else:
         price_line = f"💰 {item.price:.2f} {item.currency}  (nowa oferta, bez wyceny)"
+    sources = "\n".join(f"   • {q.shop}: {q.price:.2f} {item.currency} {q.url}" for q in stats.quotes) if stats else ""
     return "\n".join(x for x in (
         f"{'🔥' if stats is not None else '🆕'} {item.title}",
         price_line,
+        f"🛒 Źródła cen:\n{sources}" if sources else "",
         f"⭐ {seller.login or seller.id} — {seller.rating:.2f}/5 ({seller.reviews} opinii)",
         f"🏷 {details}" if details else "",
         f"🔎 {search_name}  📷 {item.photo_url or '-'}",
@@ -1571,14 +1584,10 @@ COLOR_OK = 0x2ECC71
 COLOR_ERR = 0xE74C3C
 COLOR_INFO = 0x09B1BA
 
-MODE_CHOICES = [app_commands.Choice(name=label, value=mode) for mode, label in MODE_LABELS.items()]
-TRYB_HELP = "Ocena ofert; domyślnie: okazje z frazą, wszystkie bez frazy (cała kategoria)"
-
 
 @dataclass
 class Preview:
     count: int
-    stats: MarketStats | None
 
 
 class VintedDiscordBot(discord.Client):
@@ -1598,7 +1607,6 @@ class VintedDiscordBot(discord.Client):
         self.service = SearchService(self.storage, cfg.searches, cfg.discord.max_searches)
         # Osobny klient Vinted do podglądu w komendach (sesja curl_cffi nie jest współdzielona z monitorem).
         self._preview_client = VintedClient(cfg.vinted)
-        self._preview_pricer = MarketPricer(self._preview_client, cfg.pricing)
         self._preview_lock = threading.Lock()
         self.notifier: BotNotifier | None = None
         self.monitor: Bot | None = None
@@ -1673,9 +1681,7 @@ class VintedDiscordBot(discord.Client):
         """Próbne wyszukiwanie (blokujące – wołać przez asyncio.to_thread)."""
         with self._preview_lock:
             items = self._preview_client.search(search, limit=self.cfg.polling.per_page, order="newest_first")
-            # Mediana frazy ma sens tylko w trybie "deals" – w pozostałych oszczędzamy zapytanie.
-            stats = self._preview_pricer.get_stats(search) if items and search.effective_mode == "deals" else None
-            return Preview(count=len(items), stats=stats)
+            return Preview(count=len(items))
 
 
 def _embed(title: str, description: str = "", color: int = COLOR_INFO) -> discord.Embed:
@@ -1739,27 +1745,16 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
             return
 
         threshold = search.deal_threshold or self.bot.cfg.pricing.deal_threshold
-        mode = search.effective_mode
+        pr, sl = self.bot.cfg.pricing, self.bot.cfg.seller
         lines = [
             f"**Filtry:** {describe(search, self.bot.cfg.pricing.deal_threshold)}",
             f"**Kanał:** {target.mention if target else 'domyślny'}",
             f"**Teraz:** {preview.count} najnowszych ofert w filtrach",
+            f"🔍 Każda nowa oferta: rozpoznaję **markę i model** (tytuł, w razie potrzeby opis) – bez tego pomijam. "
+            f"Cenę nowego biorę ze sklepów (min. {pr.retail_min_shops}, rozrzut cen ≤ {pr.retail_max_spread * 100:.0f}%); "
+            f"okazja przy cenie ≤ {threshold * 100:.0f}% średniej. "
+            f"Sprzedawca: ocena ≥ {sl.min_rating:g}, min. {sl.min_reviews} opinii.",
         ]
-        if mode == "all":
-            lines.append("🆕 Powiadomienie o **każdej** nowej ofercie z tych filtrów (po weryfikacji sprzedającego).")
-        elif mode == "per_item":
-            lines.append(f"🔍 Każda nowa oferta jest wyceniana osobno – wyszukiwanie po jej tytule w tej samej "
-                         f"kategorii; okazja przy cenie ≤ {threshold * 100:.0f}% mediany podobnych ofert. "
-                         f"Wycena przybliżona.")
-        elif preview.stats:
-            lines.append(f"**Mediana rynkowa:** {preview.stats.median:.2f} {self.bot.cfg.vinted.currency} "
-                         f"→ okazja poniżej **{preview.stats.median * threshold:.2f}**")
-        else:
-            lines.append("⚠️ Za mało ofert do wyceny – okazje nie będą wykrywane, dopóki próbka nie urośnie. "
-                         "Rozważ szerszą frazę.")
-        if mode == "deals" and not search.query:
-            lines.append("⚠️ Tryb „okazje” bez frazy liczy medianę z całej kategorii – przy różnorodnych "
-                         "przedmiotach (np. elektronika) lepiej użyć trybu „wszystkie” albo „z tytułu oferty”.")
         lines.append("Obecne oferty zostaną oznaczone jako widziane – powiadomienia przyjdą dla nowych.")
         await interaction.followup.send(embed=_embed(f"✅ Dodano: {search.name}", "\n".join(lines), COLOR_OK))
         log.info("Discord: %s dodał wyszukiwanie %s (%s)", interaction.user, search.name, describe(search))
@@ -1768,7 +1763,6 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
     @app_commands.describe(
         nazwa="Unikalna nazwa, np. 'Air Max 90 r.42'",
         fraza="Tekst wyszukiwania, np. 'nike air max 90' (puste = cała kategoria/marka)",
-        tryb=TRYB_HELP,
         cena_max="Maksymalna cena monitorowanych ofert",
         cena_min="Minimalna cena monitorowanych ofert",
         prog="Okazja, gdy cena ≤ tyle % mediany (domyślnie z configu)",
@@ -1778,9 +1772,7 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
         stany="ID stanów z URL (status_ids[]): 6 nowy z metką, 1 nowy, 2 bardzo dobry, 3 dobry",
         kanal="Kanał na powiadomienia (domyślnie bieżący)",
     )
-    @app_commands.choices(tryb=MODE_CHOICES)
     async def add(self, interaction: discord.Interaction, nazwa: str, fraza: str | None = None,
-                  tryb: app_commands.Choice[str] | None = None,
                   cena_max: app_commands.Range[float, 0] | None = None,
                   cena_min: app_commands.Range[float, 0] | None = None,
                   prog: app_commands.Range[int, 1, 100] | None = None,
@@ -1792,7 +1784,7 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
                 name=nazwa.strip(), query=(fraza or "").strip(), price_max=cena_max, price_min=cena_min,
                 catalog_ids=parse_ids(kategorie, "kategorie"), size_ids=parse_ids(rozmiary, "rozmiary"),
                 brand_ids=parse_ids(marki, "marki"), status_ids=parse_ids(stany, "stany"),
-                deal_threshold=prog / 100 if prog else None, mode=tryb.value if tryb else None,
+                deal_threshold=prog / 100 if prog else None,
             )
         except SearchError as e:
             await _error(interaction, str(e))
@@ -1803,13 +1795,10 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
     @app_commands.describe(
         url="Adres strony z wynikami wyszukiwania na Vinted",
         nazwa="Unikalna nazwa wyszukiwania",
-        tryb=TRYB_HELP,
         prog="Okazja, gdy cena ≤ tyle % mediany (domyślnie z configu)",
         kanal="Kanał na powiadomienia (domyślnie bieżący)",
     )
-    @app_commands.choices(tryb=MODE_CHOICES)
     async def from_url(self, interaction: discord.Interaction, url: str, nazwa: str,
-                       tryb: app_commands.Choice[str] | None = None,
                        prog: app_commands.Range[int, 1, 100] | None = None,
                        kanal: discord.TextChannel | None = None) -> None:
         try:
@@ -1817,8 +1806,7 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
         except VintedUrlError as e:
             await _error(interaction, str(e))
             return
-        search = SearchConfig(name=nazwa.strip(), deal_threshold=prog / 100 if prog else None,
-                              mode=tryb.value if tryb else None, **parsed)
+        search = SearchConfig(name=nazwa.strip(), deal_threshold=prog / 100 if prog else None, **parsed)
         await self._add(interaction, search, kanal)
 
     # ------------------------------------------------------------- lista
@@ -1920,8 +1908,9 @@ class Bot:
         self.storage = Storage(cfg.storage.db_path)
         self.searches = SearchService(self.storage, cfg.searches, cfg.discord.max_searches)
         retail, retail_factor = build_provider_from_env()
-        self.pricer = MarketPricer(self.client, cfg.pricing, retail=retail, retail_factor=retail_factor,
-                                   retail_only=True)
+        if retail is None:
+            log.warning("RETAIL_SHOPS wyłączone – bez cen ze sklepów żadna oferta nie zostanie wyceniona")
+        self.pricer = MarketPricer(cfg.pricing, retail=retail, retail_factor=retail_factor)
         self.sellers = SellerFilter(self.client, self.storage, cfg.seller)
         self.notifier = notifier
 
@@ -1947,7 +1936,8 @@ class Bot:
             return 0
         log.info("[%s] nowe oferty: %d", search.name, len(new_items))
 
-        # Jeden tryb: każda nowa oferta z kategorii jest porównywana z ceną nowego produktu ze sklepów.
+        # Każda nowa oferta: marka+model → cena nowego ze sklepów → próg → (dopiero dla okazji) sprzedawca.
+        # Sprzedawcę sprawdzamy na końcu, bo to dodatkowe zapytanie do Vinted – po co płacić za oferty bez okazji.
         threshold = search.deal_threshold or self.cfg.pricing.deal_threshold
         limit = self.cfg.pricing.per_item_max_per_cycle  # limit nowych wycen (zapytań do sklepów) na cykl
         priced = 0
@@ -1956,7 +1946,13 @@ class Bot:
         for item in reversed(new_items):
             deferred = False
             try:
-                if not self.pricer.is_item_cached(search, item):
+                product = identify_product(item)
+                if product is None and self.cfg.pricing.use_description:
+                    product = identify_product(item, self.client.get_item_description(item.id))
+                if product is None:
+                    log.debug("[%s] %s – nie ustalono marki i modelu („%s”), pomijam", search.name, item.url, item.title)
+                    continue
+                if not self.pricer.is_cached(product):
                     if priced >= limit:
                         # Nie oznaczamy jako widzianej – oferta wróci w następnym cyklu, gdy będzie limit.
                         log.info("[%s] limit %d wycen na cykl – odkładam %s", search.name, limit, item.url)
@@ -1965,9 +1961,10 @@ class Bot:
                     priced += 1
                     if priced > 1:
                         stop_event.wait(random.uniform(1, 2.5))  # nie zasypuj sklepów serią zapytań
-                stats = self.pricer.get_item_stats(search, item)
+                stats = self.pricer.get_stats(product)
                 if stats is None:
-                    log.debug("[%s] %s – brak ceny rynkowej, pomijam", search.name, item.url)
+                    log.debug("[%s] %s – brak wiarygodnej ceny rynkowej dla „%s”, pomijam",
+                              search.name, item.url, product.query)
                     continue
                 if item.price > stats.median * threshold:
                     log.debug("[%s] %s – %.2f nie jest okazją (próg %.2f)",

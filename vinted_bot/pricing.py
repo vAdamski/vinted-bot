@@ -15,6 +15,9 @@ from .scraper import Item, VintedClient
 
 log = logging.getLogger(__name__)
 
+RETAIL_TTL_HOURS = 24   # ceny sklepowe zmieniają się wolno – odpytuj źródło raz na dobę na model
+RETAIL_MIN_SAMPLE = 3   # tyle cen ze sklepów wystarczy do wyceny
+
 
 @dataclass
 class MarketStats:
@@ -24,7 +27,7 @@ class MarketStats:
     low: float         # dolna granica akceptowanych cen
     high: float        # górna granica
     computed_at: float
-    basis: str = "phrase"  # "phrase" – mediana frazy, "title" – z tytułu oferty (tryb per_item)
+    basis: str = "phrase"  # "phrase" – mediana frazy, "title" – z tytułu oferty (per_item), "retail" – ceny nowych ze sklepów
     query: str = ""        # dla basis="title": zapytanie zbudowane z tytułu
 
 
@@ -46,9 +49,17 @@ def robust_median(prices: list[float], iqr_k: float = 1.5) -> tuple[float, list[
 
 
 class MarketPricer:
-    def __init__(self, client: VintedClient, cfg: PricingConfig):
+    def __init__(self, client: VintedClient, cfg: PricingConfig, retail=None, retail_factor: float = 1.0,
+                 retail_only: bool = False):
+        """retail: opcjonalny RetailPriceProvider (retail_pricing.py) – zapasowe źródło cen nowych
+        produktów, używane w trybie per_item, gdy Vinted nie ma dość porównywalnych ofert.
+        retail_factor: mnożnik ceny sklepowej (np. 0.7, gdy porównujesz z używanymi).
+        retail_only: wycena wyłącznie z cen sklepowych (bez porównań z ofertami z Vinted)."""
         self.client = client
         self.cfg = cfg
+        self.retail = retail
+        self.retail_factor = retail_factor
+        self.retail_only = retail_only
         self._cache: dict[str, MarketStats | None] = {}
         self._cache_ts: dict[str, float] = {}
 
@@ -81,15 +92,34 @@ class MarketPricer:
         return stats
 
     def is_item_cached(self, search: SearchConfig, item: Item) -> bool:
+        """True = wycena tej oferty nie wymaga nowych zapytań do Vinted (limit per_item_max_per_cycle)."""
         query = title_query(item.title)
-        return bool(query) and self._cached(item_search(search, query))[1]
+        if not query:
+            return True  # nie ma czego wyceniać, zapytanie nie poleci
+        if self.retail_only:
+            key = "retail:" + query
+            return key in self._cache and time.time() - self._cache_ts[key] < RETAIL_TTL_HOURS * 3600
+        _, fresh, cached = self._cached(item_search(search, query))
+        # Zapytanie do Vinted kosztuje tylko wtedy, gdy cache jest nieświeży.
+        # Zapasowe źródło sklepowe to inne źródło – nie liczy się do limitu Vinted.
+        return fresh
 
     def get_item_stats(self, search: SearchConfig, item: Item) -> MarketStats | None:
-        """Tryb per_item: mediana z wyszukiwania po tytule oferty, w tej samej kategorii/marce/stanie.
-        Wycena przybliżona – tytuły bywają ogólnikowe albo w innym języku."""
+        """Tryb per_item: najpierw mediana podobnych ofert z Vinted; gdy ich brakuje – cena nowego
+        produktu ze źródła sklepowego (jeśli skonfigurowane). None = nie da się wycenić (oferta pomijana)."""
         query = title_query(item.title)
         if not query:
             return None
+        if self.retail_only:
+            return self._retail_stats(query) if self.retail is not None else None
+        stats = self._vinted_item_stats(search, item, query)
+        if stats is None and self.retail is not None:
+            stats = self._retail_stats(query)
+        return stats
+
+    def _vinted_item_stats(self, search: SearchConfig, item: Item, query: str) -> MarketStats | None:
+        """Mediana z wyszukiwania po tytule oferty, w tej samej kategorii/marce/stanie.
+        Wycena przybliżona – tytuły bywają ogólnikowe albo w innym języku."""
         derived = item_search(search, query)
         key, fresh, cached = self._cached(derived)
         if fresh:
@@ -107,6 +137,24 @@ class MarketPricer:
         log.debug("[%s] mediana dla „%s”: %s", search.name, query,
                   f"{stats.median:.2f} (pasujących {len(matched)}/{len(items)})" if stats
                   else f"brak – pasujących ofert {len(matched)}/{len(items)} (min {self.cfg.per_item_min_sample})")
+        return stats
+
+    def _retail_stats(self, query: str) -> MarketStats | None:
+        """Cena nowego produktu ze źródła sklepowego (cache RETAIL_TTL_HOURS, także negatywny)."""
+        key = "retail:" + query
+        if key in self._cache and time.time() - self._cache_ts[key] < RETAIL_TTL_HOURS * 3600:
+            return self._cache[key]
+        try:
+            prices = self.retail.lookup(query)
+        except Exception as e:  # noqa: BLE001 – awaria źródła nie może zatrzymać bota; nie cache'ujemy błędu
+            log.warning("Źródło cen sklepowych nie odpowiedziało dla „%s”: %s", query, e)
+            return None
+        stats = self._compute([p * self.retail_factor for p in prices], RETAIL_MIN_SAMPLE)
+        if stats is not None:
+            stats.basis, stats.query = "retail", query
+        self._store(key, stats)
+        log.debug("Ceny sklepowe dla „%s”: %s", query,
+                  f"mediana {stats.median:.2f} (n={stats.used_size})" if stats else f"brak ({len(prices)} cen)")
         return stats
 
     @staticmethod
@@ -140,6 +188,13 @@ _STOPWORDS = {
     "nový", "nova", "sprzedam", "okazja", "tanio", "oryginalny", "oryginalna", "oryginalne", "original", "originál",
     "metka", "metką", "metki", "tag", "tags", "tagged", "with", "bez", "brand", "sealed", "folia", "zafoliowany",
     "z", "i", "w", "na", "do", "dla", "and", "the", "for", "a", "de", "cu", "si", "și", "und", "mit", "es", "és",
+    # Kolory i opisy stanu – nie określają modelu, a zawężają zapytanie (mniej porównywalnych ofert).
+    "czarny", "czarna", "czarne", "biały", "biała", "białe", "szary", "szara", "szare", "srebrny", "srebrna",
+    "srebrne", "złote", "niebieskie", "czerwone", "zielone", "różowe", "złoty", "złota", "niebieski", "niebieska", "czerwony", "czerwona", "zielony", "zielona", "różowy", "różowa",
+    "black", "white", "grey", "gray", "silver", "gold", "blue", "red", "green", "pink",
+    "używany", "używana", "używane", "uzywany", "idealny", "idealna", "idealne", "stan", "stanie", "bardzo", "dobry",
+    "dobrym", "komplet", "kompletny", "gwarancja", "gwarancją", "paragon", "faktura", "sprawny", "sprawna",
+    "sprawne", "polecam", "super", "ładny", "ładna", "jak", "nowego", "od", "po", "oraz", "lub",
 }
 _TITLE_WORDS = 5
 

@@ -14,6 +14,7 @@ from pathlib import Path
 from .config import Config, ConfigError, SearchConfig, load_config
 from .notifier import BotNotifier, LogNotifier, NotifierError
 from .pricing import MarketPricer, discount
+from .retail_pricing import build_provider_from_env
 from .scraper import VintedClient, VintedError
 from .search_service import SearchService
 from .seller_filter import SellerFilter
@@ -47,7 +48,9 @@ class Bot:
         self.client = VintedClient(cfg.vinted)
         self.storage = Storage(cfg.storage.db_path)
         self.searches = SearchService(self.storage, cfg.searches, cfg.discord.max_searches)
-        self.pricer = MarketPricer(self.client, cfg.pricing)
+        retail, retail_factor = build_provider_from_env()
+        self.pricer = MarketPricer(self.client, cfg.pricing, retail=retail, retail_factor=retail_factor,
+                                   retail_only=True)
         self.sellers = SellerFilter(self.client, self.storage, cfg.seller)
         self.notifier = notifier
 
@@ -73,30 +76,29 @@ class Bot:
             return 0
         log.info("[%s] nowe oferty: %d", search.name, len(new_items))
 
-        mode = search.effective_mode
+        # Jeden tryb: każda nowa oferta z kategorii jest porównywana z ceną nowego produktu ze sklepów.
         threshold = search.deal_threshold or self.cfg.pricing.deal_threshold
-        stats = self.pricer.get_stats(search) if mode == "deals" else None
-        priced = 0  # tryb per_item: ile nowych wycen (zapytań) w tym cyklu
+        limit = self.cfg.pricing.per_item_max_per_cycle  # limit nowych wycen (zapytań do sklepów) na cykl
+        priced = 0
         sent = 0
         # Od najstarszej, żeby powiadomienia szły w kolejności wystawienia.
         for item in reversed(new_items):
+            deferred = False
             try:
-                if mode == "deals" and stats is None:
-                    continue
-                if mode == "per_item":
-                    if not self.pricer.is_item_cached(search, item):
-                        if priced >= self.cfg.pricing.per_item_max_per_cycle:
-                            log.warning("[%s] limit %d wycen na cykl – pomijam %s (pricing.per_item_max_per_cycle)",
-                                        search.name, self.cfg.pricing.per_item_max_per_cycle, item.url)
-                            continue
-                        priced += 1
-                        if priced > 1:
-                            stop_event.wait(random.uniform(1, 2.5))  # nie zasypuj Vinted serią zapytań
-                    stats = self.pricer.get_item_stats(search, item)
-                    if stats is None:
-                        log.debug("[%s] %s – za mało podobnych ofert do wyceny", search.name, item.url)
+                if not self.pricer.is_item_cached(search, item):
+                    if priced >= limit:
+                        # Nie oznaczamy jako widzianej – oferta wróci w następnym cyklu, gdy będzie limit.
+                        log.info("[%s] limit %d wycen na cykl – odkładam %s", search.name, limit, item.url)
+                        deferred = True
                         continue
-                if stats is not None and item.price > stats.median * threshold:
+                    priced += 1
+                    if priced > 1:
+                        stop_event.wait(random.uniform(1, 2.5))  # nie zasypuj sklepów serią zapytań
+                stats = self.pricer.get_item_stats(search, item)
+                if stats is None:
+                    log.debug("[%s] %s – brak ceny rynkowej, pomijam", search.name, item.url)
+                    continue
+                if item.price > stats.median * threshold:
                     log.debug("[%s] %s – %.2f nie jest okazją (próg %.2f)",
                               search.name, item.id, item.price, stats.median * threshold)
                     continue
@@ -104,20 +106,18 @@ class Bot:
                 if not verdict.ok:
                     log.info("[%s] oferta %s odrzucona: %s", search.name, item.url, verdict.reason)
                     continue
-                if stats is not None:
-                    log.info("[%s] OKAZJA: %s %.2f %s (mediana %.2f, -%.0f%%) %s", search.name, item.title, item.price,
-                             item.currency, stats.median, discount(item.price, stats.median) * 100, item.url)
-                else:
-                    log.info("[%s] NOWA: %s %.2f %s %s", search.name, item.title, item.price, item.currency, item.url)
+                log.info("[%s] OKAZJA: %s %.2f %s (rynek %.2f, -%.0f%%) %s", search.name, item.title, item.price,
+                         item.currency, stats.median, discount(item.price, stats.median) * 100, item.url)
                 self.notifier.send_deal(item, stats, verdict.seller, search)
                 sent += 1
             except NotifierError as e:
                 log.error("[%s] nie wysłano powiadomienia dla %s: %s", search.name, item.url, e)
             except VintedError as e:
-                log.warning("[%s] nie udało się wycenić %s: %s", search.name, item.url, e)
+                log.warning("[%s] nie udało się sprawdzić %s: %s", search.name, item.url, e)
             finally:
-                # Zawsze oznacz jako widzianą, żeby nie przetwarzać jej w kółko.
-                self.storage.mark_seen(search.name, [(item.id, item.price)])
+                if not deferred:
+                    # Oznacz jako widzianą, żeby nie przetwarzać jej w kółko.
+                    self.storage.mark_seen(search.name, [(item.id, item.price)])
         return sent
 
     def run_cycle(self) -> None:

@@ -30,6 +30,8 @@ DISCORD_COLOR_NEW = 0x5865F2  # tryb "all" – zwykła nowa oferta, nie okazja
 
 
 def _median_label(stats: MarketStats) -> str:
+    if stats.basis == "retail":
+        return f"🏬 Cena nowego (sklepy, n={stats.used_size})"
     if stats.basis == "title":
         return f"📊 Mediana podobnych (≈, n={stats.used_size})"
     return "📊 Mediana"
@@ -54,8 +56,8 @@ def build_discord_embed(item: Item, stats: MarketStats | None, seller: Seller, s
     if details:
         fields.append({"name": "🏷 Szczegóły", "value": _md(details)[:1024], "inline": False})
     footer = f"🔎 {search_name}"
-    if stats is not None and stats.basis == "title":
-        footer += f" · wycena z tytułu: „{stats.query}”"
+    if stats is not None and stats.basis in ("title", "retail"):
+        footer += f" · wycena {'ze sklepów' if stats.basis == 'retail' else 'z tytułu'}: „{stats.query}”"
     embed = {
         "title": f"{'🔥' if stats is not None else '🆕'} {item.title}"[:256],
         "url": item.url,
@@ -74,7 +76,9 @@ def format_deal_text(item: Item, stats: MarketStats | None, seller: Seller, sear
     details = " · ".join(x for x in (item.brand, item.details) if x)
     if stats is not None:
         pct = discount(item.price, stats.median) * 100
-        basis = f" (z tytułu „{stats.query}”, n={stats.used_size})" if stats.basis == "title" else ""
+        basis = ""
+        if stats.basis in ("title", "retail"):
+            basis = f" ({'sklepy' if stats.basis == 'retail' else 'z tytułu'} „{stats.query}”, n={stats.used_size})"
         price_line = (f"💰 {item.price:.2f} {item.currency}  📊 mediana {stats.median:.2f}{basis}"
                       f"  📉 {pct:.0f}% taniej")
     else:

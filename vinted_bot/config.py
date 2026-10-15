@@ -14,6 +14,13 @@ class ConfigError(Exception):
     pass
 
 
+# Tryby oceny ofert w wyszukiwaniu:
+#   deals    – okazja, gdy cena ≤ próg × mediana dla frazy wyszukiwania
+#   all      – powiadomienie o każdej nowej ofercie z filtrów (np. cała kategoria)
+#   per_item – mediana liczona osobno dla każdej oferty, z wyszukiwania po jej tytule
+MODES = ("deals", "all", "per_item")
+
+
 @dataclass
 class VintedConfig:
     domain: str = "www.vinted.pl"
@@ -43,6 +50,9 @@ class PricingConfig:
     iqr_k: float = 1.5
     cache_ttl_minutes: float = 60
     order: str = "newest_first"
+    per_item_sample: int = 96        # tryb per_item: ile ofert pobrać dla tytułu (większość odpada w filtrze trafności)
+    per_item_min_sample: int = 8     # tryb per_item: mniej ofert => brak wyceny, brak powiadomienia
+    per_item_max_per_cycle: int = 10 # tryb per_item: limit wycen na wyszukiwanie w jednym cyklu
 
 
 @dataclass
@@ -75,7 +85,7 @@ class DiscordConfig:
 @dataclass
 class SearchConfig:
     name: str
-    query: str
+    query: str = ""                # pusta = cała kategoria/marka z filtrów
     price_max: float | None = None
     price_min: float | None = None
     catalog_ids: list[int] = field(default_factory=list)
@@ -85,8 +95,13 @@ class SearchConfig:
     # Inne filtry z URL-a Vinted, np. {"color": [1, 12], "material": [44]}
     attributes: dict[str, list[int]] = field(default_factory=dict)
     deal_threshold: float | None = None  # None = użyj pricing.deal_threshold
+    mode: str | None = None        # deals | all | per_item; None = deals z frazą, all bez frazy
     channel_id: int | None = None  # None = kanał domyślny (DISCORD_CHANNEL_ID)
     source: str = "yaml"           # "yaml" | "discord" – ustawiane w kodzie
+
+    @property
+    def effective_mode(self) -> str:
+        return self.mode or ("deals" if self.query else "all")
 
 
 @dataclass
@@ -154,6 +169,8 @@ def load_config(path: str | Path = "config.yaml", env_file: str | Path = ".env")
     searches = [_build(SearchConfig, s) for s in raw.get("searches") or []]
     for s in searches:
         s.source = "yaml"
+        if s.mode is not None and s.mode not in MODES:
+            raise ConfigError(f"[{s.name}] mode musi być jednym z: {', '.join(MODES)}")
     names = [s.name for s in searches]
     if len(names) != len(set(names)):
         raise ConfigError("Nazwy w 'searches' muszą być unikalne")

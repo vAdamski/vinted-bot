@@ -73,28 +73,48 @@ class Bot:
             return 0
         log.info("[%s] nowe oferty: %d", search.name, len(new_items))
 
-        stats = self.pricer.get_stats(search)
+        mode = search.effective_mode
         threshold = search.deal_threshold or self.cfg.pricing.deal_threshold
+        stats = self.pricer.get_stats(search) if mode == "deals" else None
+        priced = 0  # tryb per_item: ile nowych wycen (zapytań) w tym cyklu
         sent = 0
         # Od najstarszej, żeby powiadomienia szły w kolejności wystawienia.
         for item in reversed(new_items):
             try:
-                if stats is None:
+                if mode == "deals" and stats is None:
                     continue
-                if item.price > stats.median * threshold:
+                if mode == "per_item":
+                    if not self.pricer.is_item_cached(search, item):
+                        if priced >= self.cfg.pricing.per_item_max_per_cycle:
+                            log.warning("[%s] limit %d wycen na cykl – pomijam %s (pricing.per_item_max_per_cycle)",
+                                        search.name, self.cfg.pricing.per_item_max_per_cycle, item.url)
+                            continue
+                        priced += 1
+                        if priced > 1:
+                            stop_event.wait(random.uniform(1, 2.5))  # nie zasypuj Vinted serią zapytań
+                    stats = self.pricer.get_item_stats(search, item)
+                    if stats is None:
+                        log.debug("[%s] %s – za mało podobnych ofert do wyceny", search.name, item.url)
+                        continue
+                if stats is not None and item.price > stats.median * threshold:
                     log.debug("[%s] %s – %.2f nie jest okazją (próg %.2f)",
                               search.name, item.id, item.price, stats.median * threshold)
                     continue
                 verdict = self.sellers.check(item.seller_id)
                 if not verdict.ok:
-                    log.info("[%s] okazja %s odrzucona: %s", search.name, item.url, verdict.reason)
+                    log.info("[%s] oferta %s odrzucona: %s", search.name, item.url, verdict.reason)
                     continue
-                log.info("[%s] OKAZJA: %s %.2f %s (mediana %.2f, -%.0f%%) %s", search.name, item.title,
-                         item.price, item.currency, stats.median, discount(item.price, stats.median) * 100, item.url)
+                if stats is not None:
+                    log.info("[%s] OKAZJA: %s %.2f %s (mediana %.2f, -%.0f%%) %s", search.name, item.title, item.price,
+                             item.currency, stats.median, discount(item.price, stats.median) * 100, item.url)
+                else:
+                    log.info("[%s] NOWA: %s %.2f %s %s", search.name, item.title, item.price, item.currency, item.url)
                 self.notifier.send_deal(item, stats, verdict.seller, search)
                 sent += 1
             except NotifierError as e:
                 log.error("[%s] nie wysłano powiadomienia dla %s: %s", search.name, item.url, e)
+            except VintedError as e:
+                log.warning("[%s] nie udało się wycenić %s: %s", search.name, item.url, e)
             finally:
                 # Zawsze oznacz jako widzianą, żeby nie przetwarzać jej w kółko.
                 self.storage.mark_seen(search.name, [(item.id, item.price)])

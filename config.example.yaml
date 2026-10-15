@@ -24,6 +24,10 @@ pricing:
   iqr_k: 1.5                     # odrzucanie wartości spoza [Q1 - k*IQR, Q3 + k*IQR]
   cache_ttl_minutes: 60          # jak często przeliczać medianę dla frazy
   order: newest_first            # sortowanie próbki: newest_first (zalecane) | relevance – zawyża medianę
+  # Tryb per_item (wycena każdej oferty osobno, po jej tytule):
+  per_item_sample: 96            # ile ofert pobrać dla tytułu (większość odpada w filtrze trafności)
+  per_item_min_sample: 8         # mniej pasujących ofert => brak wyceny, brak powiadomienia
+  per_item_max_per_cycle: 10     # limit wycen (= zapytań do Vinted) na wyszukiwanie w jednym cyklu
 
 seller:
   min_rating: 4.5                # w skali 0–5
@@ -70,3 +74,13 @@ searches:
     query: "lego technic"
     price_max: 400
     deal_threshold: 0.65         # nadpisanie globalnego progu dla tej frazy
+
+  # Cała kategoria bez frazy. mode:
+  #   deals    – okazja wg mediany frazy (domyślny, gdy jest query)
+  #   all      – każda nowa oferta z filtrów (domyślny bez query)
+  #   per_item – każda oferta wyceniana osobno po swoim tytule (przybliżone, tylko popularne modele)
+  - name: "Elektronika nowe 200+"
+    catalog_ids: [2994]          # Elektronika
+    price_min: 200
+    status_ids: [6]              # nowy z metką
+    mode: all

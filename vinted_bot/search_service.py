@@ -6,10 +6,16 @@ from __future__ import annotations
 
 import re
 
-from .config import SearchConfig
+from .config import MODES, SearchConfig
 from .storage import Storage, StoredSearch
 
 NAME_RE = re.compile(r"^[\w .,+&#'()\-]{1,50}$")
+
+MODE_LABELS = {
+    "deals": "okazje (mediana frazy)",
+    "all": "wszystkie nowe oferty",
+    "per_item": "okazje (mediana z tytułu oferty)",
+}
 
 
 class SearchError(Exception):
@@ -44,8 +50,10 @@ def describe(search: SearchConfig, default_threshold: float | None = None) -> st
         parts.append(f"≥ {search.price_min:g}")
     if search.price_max is not None:
         parts.append(f"≤ {search.price_max:g}")
+    mode = search.effective_mode
+    parts.append(f"tryb: {MODE_LABELS[mode]}")
     threshold = search.deal_threshold or default_threshold
-    if threshold:
+    if threshold and mode != "all":
         parts.append(f"próg {threshold * 100:.0f}%" + ("" if search.deal_threshold else " (domyślny)"))
     return " · ".join(parts)
 
@@ -83,6 +91,8 @@ class SearchService:
                               "(discord.max_searches w config.yaml). Usuń któreś albo podnieś limit.")
         if not (search.query or search.catalog_ids or search.brand_ids):
             raise SearchError("Podaj frazę, kategorię albo markę – inaczej wyszukiwanie obejmie cały Vinted")
+        if search.mode is not None and search.mode not in MODES:
+            raise SearchError(f"Nieznany tryb {search.mode!r}")
         if search.price_min is not None and search.price_max is not None and search.price_min > search.price_max:
             raise SearchError("cena_min jest większa niż cena_max")
 

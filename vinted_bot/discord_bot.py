@@ -17,7 +17,7 @@ from .config import Config, SearchConfig
 from .notifier import BotNotifier
 from .pricing import MarketPricer, MarketStats
 from .scraper import VintedClient, VintedError
-from .search_service import SearchError, SearchService, describe, parse_ids
+from .search_service import MODE_LABELS, SearchError, SearchService, describe, parse_ids
 from .storage import Storage
 from .vinted_url import VintedUrlError, parse_catalog_url
 
@@ -33,6 +33,9 @@ discord.VoiceClient.warn_dave = False
 COLOR_OK = 0x2ECC71
 COLOR_ERR = 0xE74C3C
 COLOR_INFO = 0x09B1BA
+
+MODE_CHOICES = [app_commands.Choice(name=label, value=mode) for mode, label in MODE_LABELS.items()]
+TRYB_HELP = "Ocena ofert; domyślnie: okazje z frazą, wszystkie bez frazy (cała kategoria)"
 
 
 @dataclass
@@ -133,7 +136,8 @@ class VintedDiscordBot(discord.Client):
         """Próbne wyszukiwanie (blokujące – wołać przez asyncio.to_thread)."""
         with self._preview_lock:
             items = self._preview_client.search(search, limit=self.cfg.polling.per_page, order="newest_first")
-            stats = self._preview_pricer.get_stats(search) if items else None
+            # Mediana frazy ma sens tylko w trybie "deals" – w pozostałych oszczędzamy zapytanie.
+            stats = self._preview_pricer.get_stats(search) if items and search.effective_mode == "deals" else None
             return Preview(count=len(items), stats=stats)
 
 
@@ -199,17 +203,27 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
             return
 
         threshold = search.deal_threshold or self.bot.cfg.pricing.deal_threshold
+        mode = search.effective_mode
         lines = [
             f"**Filtry:** {describe(search, self.bot.cfg.pricing.deal_threshold)}",
             f"**Kanał:** {target.mention if target else 'domyślny'}",
             f"**Teraz:** {preview.count} najnowszych ofert w filtrach",
         ]
-        if preview.stats:
+        if mode == "all":
+            lines.append("🆕 Powiadomienie o **każdej** nowej ofercie z tych filtrów (po weryfikacji sprzedającego).")
+        elif mode == "per_item":
+            lines.append(f"🔍 Każda nowa oferta jest wyceniana osobno – wyszukiwanie po jej tytule w tej samej "
+                         f"kategorii; okazja przy cenie ≤ {threshold * 100:.0f}% mediany podobnych ofert. "
+                         f"Wycena przybliżona.")
+        elif preview.stats:
             lines.append(f"**Mediana rynkowa:** {preview.stats.median:.2f} {self.bot.cfg.vinted.currency} "
                          f"→ okazja poniżej **{preview.stats.median * threshold:.2f}**")
         else:
             lines.append("⚠️ Za mało ofert do wyceny – okazje nie będą wykrywane, dopóki próbka nie urośnie. "
                          "Rozważ szerszą frazę.")
+        if mode == "deals" and not search.query:
+            lines.append("⚠️ Tryb „okazje” bez frazy liczy medianę z całej kategorii – przy różnorodnych "
+                         "przedmiotach (np. elektronika) lepiej użyć trybu „wszystkie” albo „z tytułu oferty”.")
         lines.append("Obecne oferty zostaną oznaczone jako widziane – powiadomienia przyjdą dla nowych.")
         await interaction.followup.send(embed=_embed(f"✅ Dodano: {search.name}", "\n".join(lines), COLOR_OK))
         log.info("Discord: %s dodał wyszukiwanie %s (%s)", interaction.user, search.name, describe(search))
@@ -217,7 +231,8 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
     @app_commands.command(name="dodaj", description="Dodaj wyszukiwanie ręcznie")
     @app_commands.describe(
         nazwa="Unikalna nazwa, np. 'Air Max 90 r.42'",
-        fraza="Tekst wyszukiwania, np. 'nike air max 90'",
+        fraza="Tekst wyszukiwania, np. 'nike air max 90' (puste = cała kategoria/marka)",
+        tryb=TRYB_HELP,
         cena_max="Maksymalna cena monitorowanych ofert",
         cena_min="Minimalna cena monitorowanych ofert",
         prog="Okazja, gdy cena ≤ tyle % mediany (domyślnie z configu)",
@@ -227,7 +242,9 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
         stany="ID stanów z URL (status_ids[]): 6 nowy z metką, 1 nowy, 2 bardzo dobry, 3 dobry",
         kanal="Kanał na powiadomienia (domyślnie bieżący)",
     )
-    async def add(self, interaction: discord.Interaction, nazwa: str, fraza: str,
+    @app_commands.choices(tryb=MODE_CHOICES)
+    async def add(self, interaction: discord.Interaction, nazwa: str, fraza: str | None = None,
+                  tryb: app_commands.Choice[str] | None = None,
                   cena_max: app_commands.Range[float, 0] | None = None,
                   cena_min: app_commands.Range[float, 0] | None = None,
                   prog: app_commands.Range[int, 1, 100] | None = None,
@@ -236,10 +253,10 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
                   kanal: discord.TextChannel | None = None) -> None:
         try:
             search = SearchConfig(
-                name=nazwa.strip(), query=fraza.strip(), price_max=cena_max, price_min=cena_min,
+                name=nazwa.strip(), query=(fraza or "").strip(), price_max=cena_max, price_min=cena_min,
                 catalog_ids=parse_ids(kategorie, "kategorie"), size_ids=parse_ids(rozmiary, "rozmiary"),
                 brand_ids=parse_ids(marki, "marki"), status_ids=parse_ids(stany, "stany"),
-                deal_threshold=prog / 100 if prog else None,
+                deal_threshold=prog / 100 if prog else None, mode=tryb.value if tryb else None,
             )
         except SearchError as e:
             await _error(interaction, str(e))
@@ -250,10 +267,13 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
     @app_commands.describe(
         url="Adres strony z wynikami wyszukiwania na Vinted",
         nazwa="Unikalna nazwa wyszukiwania",
+        tryb=TRYB_HELP,
         prog="Okazja, gdy cena ≤ tyle % mediany (domyślnie z configu)",
         kanal="Kanał na powiadomienia (domyślnie bieżący)",
     )
+    @app_commands.choices(tryb=MODE_CHOICES)
     async def from_url(self, interaction: discord.Interaction, url: str, nazwa: str,
+                       tryb: app_commands.Choice[str] | None = None,
                        prog: app_commands.Range[int, 1, 100] | None = None,
                        kanal: discord.TextChannel | None = None) -> None:
         try:
@@ -261,7 +281,8 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
         except VintedUrlError as e:
             await _error(interaction, str(e))
             return
-        search = SearchConfig(name=nazwa.strip(), deal_threshold=prog / 100 if prog else None, **fields)
+        search = SearchConfig(name=nazwa.strip(), deal_threshold=prog / 100 if prog else None,
+                              mode=tryb.value if tryb else None, **fields)
         await self._add(interaction, search, kanal)
 
     # ------------------------------------------------------------- lista

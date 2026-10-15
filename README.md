@@ -69,8 +69,8 @@ Dostępne tylko dla osób z uprawnieniem *Zarządzanie serwerem* (zmienisz to w
 
 | Komenda | Opis |
 |---|---|
-| `/szukaj z-linku url nazwa [prog] [kanal]` | **Najprościej:** ustaw filtry na vinted.pl, skopiuj adres strony z wynikami i wklej. |
-| `/szukaj dodaj nazwa fraza [cena_max] [cena_min] [prog] [kategorie] [rozmiary] [marki] [stany] [kanal]` | Ręcznie; ID podawaj po przecinku, `prog` w % mediany (np. 70). |
+| `/szukaj z-linku url nazwa [tryb] [prog] [kanal]` | **Najprościej:** ustaw filtry na vinted.pl, skopiuj adres strony z wynikami i wklej. |
+| `/szukaj dodaj nazwa [fraza] [tryb] [cena_max] [cena_min] [prog] [kategorie] [rozmiary] [marki] [stany] [kanal]` | Ręcznie; ID podawaj po przecinku, `prog` w % mediany (np. 70). Bez frazy = cała kategoria/marka. |
 | `/szukaj lista` | Wszystkie wyszukiwania (🔒 z config.yaml, ▶️/⏸️ z Discorda) i liczba zapytań na cykl. |
 | `/szukaj pauza nazwa` / `/szukaj wznow nazwa` | Wstrzymanie bez usuwania. Po wznowieniu oferty z czasu pauzy nie są wysyłane. |
 | `/szukaj usun nazwa` | Usunięcie (tylko wyszukiwań dodanych z Discorda). |
@@ -79,6 +79,37 @@ Przy dodawaniu bot robi próbne wyszukiwanie i pokazuje liczbę ofert oraz media
 nie znajdzie, nie zapisze wyszukiwania. Powiadomienia trafiają na kanał, na którym wpisano
 komendę (albo wskazany w `kanal`). Limit wyszukiwań z Discorda: `discord.max_searches` (25).
 Każde aktywne wyszukiwanie to 1 zapytanie do Vinted na cykl, więc dużo wyszukiwań = większe ryzyko 403.
+
+### Tryby oceny ofert
+
+Każde wyszukiwanie ma tryb (`mode` w YAML, opcja `tryb` w komendach):
+
+| Tryb | Kiedy powiadomienie | Do czego |
+|---|---|---|
+| `deals` – okazje (mediana frazy) | cena ≤ próg × mediana ofert dla frazy | konkretny produkt: „lego technic 42115”, „air max 90” |
+| `all` – wszystkie nowe | każda nowa oferta z filtrów (po weryfikacji sprzedającego) | cała kategoria: „Elektronika, od 200 zł, nowe z metką” |
+| `per_item` – okazje z tytułu | cena ≤ próg × mediana ofert podobnych do **tej** oferty | kategoria, ale tylko okazje |
+
+Domyślnie: `deals`, gdy jest fraza, i `all`, gdy jej nie ma (sama kategoria/marka).
+
+**Dlaczego nie `deals` dla całej kategorii?** Mediana Elektroniki to średnio kilkaset złotych
+z kart pamięci i telewizorów razem. Taniej od niej będą zawsze tanie drobiazgi, a nigdy drogi sprzęt.
+
+**Jak działa `per_item`:** z tytułu nowej oferty bot buduje zapytanie (np. „Głośnik JBL Flip 7 NOWY”
+→ „glosnik jbl flip 7”) i szuka w tej samej kategorii i stanie. Wyszukiwarka Vinted zwraca też
+akcesoria i inne modele, więc do mediany trafiają tylko oferty, których tytuł pasuje do zapytania.
+Wszystkie oznaczenia modelu (s9, flip 7/flip7) muszą się zgadzać, a etui, ładowarki itp. są odrzucane.
+Ograniczenia, sprawdzone na żywej Elektronice:
+- wycenę dostaje mniej więcej 1 na kilka–kilkanaście ofert, bo dla rzadszych modeli i tytułów
+  w obcych językach (Vinted pokazuje też oferty z innych krajów) brak 8 porównywalnych ofert;
+  takie oferty są pomijane, a nie zgadywane;
+- każda wycena to dodatkowe zapytanie do Vinted (limit `per_item_max_per_cycle`, cache na `cache_ttl_minutes`);
+- mediana to wciąż ceny wystawienia, a nie sprzedaży – traktuj ją jako orientacyjną.
+
+Przykład – Elektronika od 200 zł, nowe z metką:
+```
+/szukaj z-linku url:https://www.vinted.pl/catalog?catalog[]=2994&price_from=200&status_ids[]=6 nazwa:Elektronika tryb:wszystkie nowe oferty
+```
 
 ### Wyszukiwania w config.yaml
 

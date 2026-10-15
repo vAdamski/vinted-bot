@@ -26,28 +26,42 @@ def _md(text: str) -> str:
     return re.sub(r"([\\*_~`|>\[\]()])", r"\\\1", text)
 
 
-def build_discord_embed(item: Item, stats: MarketStats, seller: Seller, search_name: str) -> dict:
-    pct = discount(item.price, stats.median) * 100
+DISCORD_COLOR_NEW = 0x5865F2  # tryb "all" – zwykła nowa oferta, nie okazja
+
+
+def _median_label(stats: MarketStats) -> str:
+    if stats.basis == "title":
+        return f"📊 Mediana podobnych (≈, n={stats.used_size})"
+    return "📊 Mediana"
+
+
+def build_discord_embed(item: Item, stats: MarketStats | None, seller: Seller, search_name: str) -> dict:
+    """stats=None – tryb "all": nowa oferta bez wyceny."""
     price = f"**{item.price:.2f} {item.currency}**"
     if item.total_price:
         price += f" (z ochroną: {item.total_price:.2f})"
-    fields = [
-        {"name": "💰 Cena", "value": price, "inline": True},
-        {"name": "📊 Mediana", "value": f"{stats.median:.2f} {item.currency}", "inline": True},
-        {"name": "📉 Taniej", "value": f"**{pct:.0f}%**", "inline": True},
-        {"name": "⭐ Sprzedający",
-         "value": f"{_md(seller.login or str(seller.id))} — {seller.rating:.2f}/5 ({seller.reviews} opinii)",
-         "inline": False},
-    ]
+    fields = [{"name": "💰 Cena", "value": price, "inline": True}]
+    if stats is not None:
+        pct = discount(item.price, stats.median) * 100
+        fields += [
+            {"name": _median_label(stats), "value": f"{stats.median:.2f} {item.currency}", "inline": True},
+            {"name": "📉 Taniej", "value": f"**{pct:.0f}%**", "inline": True},
+        ]
+    fields.append({"name": "⭐ Sprzedający",
+                   "value": f"{_md(seller.login or str(seller.id))} — {seller.rating:.2f}/5 ({seller.reviews} opinii)",
+                   "inline": False})
     details = " · ".join(x for x in (item.brand, item.details) if x)
     if details:
         fields.append({"name": "🏷 Szczegóły", "value": _md(details)[:1024], "inline": False})
+    footer = f"🔎 {search_name}"
+    if stats is not None and stats.basis == "title":
+        footer += f" · wycena z tytułu: „{stats.query}”"
     embed = {
-        "title": f"🔥 {item.title}"[:256],
+        "title": f"{'🔥' if stats is not None else '🆕'} {item.title}"[:256],
         "url": item.url,
-        "color": DISCORD_COLOR,
+        "color": DISCORD_COLOR if stats is not None else DISCORD_COLOR_NEW,
         "fields": fields,
-        "footer": {"text": f"🔎 {search_name}"[:2048]},
+        "footer": {"text": footer[:2048]},
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
     if item.photo_url:
@@ -55,13 +69,19 @@ def build_discord_embed(item: Item, stats: MarketStats, seller: Seller, search_n
     return embed
 
 
-def format_deal_text(item: Item, stats: MarketStats, seller: Seller, search_name: str) -> str:
+def format_deal_text(item: Item, stats: MarketStats | None, seller: Seller, search_name: str) -> str:
     """Zwykły tekst okazji – do logu w trybie --dry-run."""
-    pct = discount(item.price, stats.median) * 100
     details = " · ".join(x for x in (item.brand, item.details) if x)
+    if stats is not None:
+        pct = discount(item.price, stats.median) * 100
+        basis = f" (z tytułu „{stats.query}”, n={stats.used_size})" if stats.basis == "title" else ""
+        price_line = (f"💰 {item.price:.2f} {item.currency}  📊 mediana {stats.median:.2f}{basis}"
+                      f"  📉 {pct:.0f}% taniej")
+    else:
+        price_line = f"💰 {item.price:.2f} {item.currency}  (nowa oferta, bez wyceny)"
     return "\n".join(x for x in (
-        f"🔥 {item.title}",
-        f"💰 {item.price:.2f} {item.currency}  📊 mediana {stats.median:.2f}  📉 {pct:.0f}% taniej",
+        f"{'🔥' if stats is not None else '🆕'} {item.title}",
+        price_line,
         f"⭐ {seller.login or seller.id} — {seller.rating:.2f}/5 ({seller.reviews} opinii)",
         f"🏷 {details}" if details else "",
         f"🔎 {search_name}  📷 {item.photo_url or '-'}",
@@ -75,8 +95,8 @@ class LogNotifier:
     def send_text(self, text: str) -> None:
         log.info("[DRY-RUN] wiadomość:\n%s", text)
 
-    def send_deal(self, item: Item, stats: MarketStats, seller: Seller, search: SearchConfig) -> None:
-        log.info("[DRY-RUN] okazja:\n%s", format_deal_text(item, stats, seller, search.name))
+    def send_deal(self, item: Item, stats: MarketStats | None, seller: Seller, search: SearchConfig) -> None:
+        log.info("[DRY-RUN] oferta:\n%s", format_deal_text(item, stats, seller, search.name))
 
 
 class BotNotifier:
@@ -123,6 +143,6 @@ class BotNotifier:
     def send_text(self, text: str, channel_id: int | None = None) -> None:
         self._run(self.send_async(channel_id, content=text[:2000]))
 
-    def send_deal(self, item: Item, stats: MarketStats, seller: Seller, search: SearchConfig) -> None:
+    def send_deal(self, item: Item, stats: MarketStats | None, seller: Seller, search: SearchConfig) -> None:
         embed = discord.Embed.from_dict(build_discord_embed(item, stats, seller, search.name))
         self._run(self.send_async(search.channel_id, embed=embed))

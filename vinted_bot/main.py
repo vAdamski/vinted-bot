@@ -1,4 +1,4 @@
-"""Główna pętla bota: wyszukiwanie → nowe oferty → wycena → sprzedający → Discord."""
+"""Gowna pętla bota: wyszukiwanie → nowe oferty → wycena → sprzedający → Discord."""
 from __future__ import annotations
 
 import argparse

@@ -1,0 +1,72 @@
+# Skopiuj do config.yaml i dostosuj:  cp config.example.yaml config.yaml
+# Sekrety (token bota Discord, ID kanału, proxy) trzymaj w pliku .env.
+
+vinted:
+  domain: www.vinted.pl          # www.vinted.de, www.vinted.fr, ...
+  currency: PLN
+  api_host: null                 # null = auto (api.vinted.pl); host API gateway wyszukiwarki
+  impersonate: chrome            # profil TLS/HTTP2 przeglądarki dla curl_cffi
+  request_timeout: 20            # sekundy
+  max_retries: 5                 # ponowienia przy 403/429/5xx/błędach sieci
+  backoff_base: 5                # sekundy; rośnie wykładniczo: 5, 10, 20, 40...
+  backoff_max: 300               # górny limit pojedynczego oczekiwania
+
+polling:
+  min_interval: 30               # losowy odstęp między cyklami [min, max] w sekundach
+  max_interval: 60
+  delay_between_searches: [2, 5] # pauza między kolejnymi frazami w jednym cyklu
+  per_page: 30                   # ile najnowszych ofert pobierać w każdym cyklu
+
+pricing:
+  deal_threshold: 0.75           # okazja, gdy cena <= 75% mediany
+  sample_size: 96                # ile ofert brać do wyceny (50–100; >96 = 2 strony)
+  min_sample: 15                 # mniej ofert po odrzuceniu skrajnych => brak wyceny
+  iqr_k: 1.5                     # odrzucanie wartości spoza [Q1 - k*IQR, Q3 + k*IQR]
+  cache_ttl_minutes: 60          # jak często przeliczać medianę dla frazy
+  order: newest_first            # sortowanie próbki: newest_first (zalecane) | relevance – zawyża medianę
+
+seller:
+  min_rating: 4.5                # w skali 0–5
+  min_reviews: 5
+  cache_ttl_hours: 12            # cache profilu sprzedającego w SQLite
+
+storage:
+  db_path: data/vinted.db
+  retention_days: 30             # po ilu dniach usuwać stare ID z bazy
+
+logging:
+  level: INFO
+  file: data/bot.log             # null = tylko konsola
+
+discord:
+  max_searches: 25               # limit wyszukiwań dodawanych komendą /szukaj (każde = 1 zapytanie na cykl)
+
+# Przy pierwszym uruchomieniu danej frazy oznacz obecne oferty jako widziane
+# bez wysyłania powiadomień (żeby nie dostać spamu ze starymi ofertami).
+notify_on_first_run: false
+
+# Wyszukiwania stałe. Można je też dodawać na Discordzie: /szukaj z-linku <url> <nazwa>
+# (te z Discorda są w bazie SQLite; te tutaj są na Discordzie tylko do odczytu).
+# Lista może być pusta:  searches: []
+#
+# ID kategorii/rozmiarów/marek/stanu najprościej wziąć z adresu URL
+# po ustawieniu filtrów na vinted.pl, np.:
+#   https://www.vinted.pl/catalog?search_text=air%20max&catalog[]=1242&size_ids[]=784&brand_ids[]=53&status_ids[]=6
+#   => catalog_ids: [1242], size_ids: [784], brand_ids: [53], status_ids: [6]
+# Pozostałe filtry z URL-a (np. color_ids[]=1, material_ids[]=44) wpisz w `attributes`
+# bez końcówki "_ids":  attributes: {color: [1], material: [44]}
+searches:
+  - name: "Nike Air Max 90"
+    query: "nike air max 90"
+    price_max: 250
+    catalog_ids: [1242]          # Mężczyźni > Obuwie > Sneakersy
+    size_ids: []                 # np. [784] = 42
+    brand_ids: []
+    status_ids: []               # stan: 6=nowy z metką, 1=nowy bez metki, 2=bardzo dobry, 3=dobry
+    attributes: {}
+    # channel_id: 123456789012345678   # inny kanał niż DISCORD_CHANNEL_ID
+
+  - name: "Lego Technic"
+    query: "lego technic"
+    price_max: 400
+    deal_threshold: 0.65         # nadpisanie globalnego progu dla tej frazy

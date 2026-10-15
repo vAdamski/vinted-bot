@@ -1,0 +1,18 @@
+# systemd unit dla Linuksa / kontenera LXC na Proxmoxie.
+# Instalacja: sudo cp deploy/vinted-bot.service /etc/systemd/system/
+#             sudo systemctl daemon-reload && sudo systemctl enable --now vinted-bot
+[Unit]
+Description=Vinted deal bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vinted
+WorkingDirectory=/opt/vinted-bot
+ExecStart=/opt/vinted-bot/.venv/bin/python -m vinted_bot --config /opt/vinted-bot/config.yaml --env /opt/vinted-bot/.env
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

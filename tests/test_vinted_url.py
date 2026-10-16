@@ -1,6 +1,6 @@
 import pytest
 
-from vinted_bot.vinted_url import VintedUrlError, parse_catalog_url
+from vinted_bot.vinted_bot import VintedUrlError, parse_catalog_url
 
 
 def test_full_catalog_url():

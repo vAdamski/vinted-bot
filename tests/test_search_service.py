@@ -1,8 +1,8 @@
 import pytest
 
-from vinted_bot.config import SearchConfig
-from vinted_bot.search_service import SearchError, SearchService, describe, parse_ids
-from vinted_bot.storage import Storage
+from vinted_bot.vinted_bot import SearchConfig
+from vinted_bot.vinted_bot import SearchError, SearchService, describe, parse_ids
+from vinted_bot.vinted_bot import Storage
 
 
 @pytest.fixture

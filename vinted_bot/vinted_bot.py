@@ -40,7 +40,7 @@ from curl_cffi.requests.exceptions import RequestException
 from discord import app_commands
 from dotenv import load_dotenv
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"
 
 log = logging.getLogger("vinted_bot")
 stop_event = threading.Event()
@@ -748,6 +748,7 @@ _GENERIC = {
     "klawiatura", "mysz", "router", "powerbank", "telewizor", "tv", "soundbar", "bezprzewodowe", "bezprzewodowy",
     "bezprzewodowa", "bluetooth", "wireless", "headphones", "speaker", "phone", "earbuds", "douszne", "nauszne",
     "gaming", "gamingowy", "gamingowa", "elektryczna", "elektryczny", "profesjonalna", "profesjonalny", "model",
+    "gamer", "headset", "zestaw", "set", "pro", "led", "rgb", "usb", "hd", "4k", "mini", "smart",
 }
 # Modele bez cyfry w nazwie, które i tak jednoznacznie identyfikują produkt – dopisuj własne.
 KNOWN_MODEL_WORDS = {"airwrap", "supersonic", "corrale", "airstrait", "airpods", "kindle", "roomba", "switch"}
@@ -762,7 +763,9 @@ KNOWN_BRANDS = {
     "irobot", "roborock", "dreame", "ecovacs", "nespresso", "delonghi", "krups", "kenwood", "wahl", "moser",
     "andis", "cecotec", "oral-b", "sandisk", "kingston", "corsair", "playstation", "xbox",
 }
-_NO_BRAND = {"inne", "inna", "inny", "other", "brak", "none", "no brand", "nieznana", "bez marki", "unbranded"}
+_NO_BRAND = {"inne", "inna", "inny", "inne marki", "inna marka", "other", "others", "brak", "brak marki", "none",
+             "no brand", "no name", "noname", "nieznana", "nieznany", "bez marki", "unbranded", "generic",
+             "oem", "marka wlasna", "private label", "n/a", "-"}
 _MODEL_SUFFIXES = {"pro", "max", "plus", "ultra", "mini", "lite", "se", "fe", "xl", "air", "neo", "gt", "turbo"}
 _WORD_RE = re.compile(r"[\w][\w\-]*")
 _UNIT_RE = re.compile(r"^\d+(?:[.,]\d+)?(?:gb|tb|mb|cm|mm|ml|mah|hz|w|v|kg|g|m|l|k|szt|zl|zł|pln|eur|cali|cal|inch)$")
@@ -802,14 +805,35 @@ def _model_from(text: str, brand_words: set[str]) -> str | None:
     for w in words:
         if w in KNOWN_MODEL_WORDS:
             return w
+    # Nośniki pamięci itp.: nazwa serii + pojemność (kingston canvas select plus 128gb).
+    for i, w in enumerate(words):
+        if i and re.fullmatch(r"\d+(?:gb|tb)", w):
+            prev = [x for x in words[max(0, i - 3):i] if not any(ch.isdigit() for ch in x)]
+            if prev and any(len(x) >= 4 for x in prev):
+                return " ".join(prev + [w])
     return None
 
 
+def _valid_brand_hint(hint: str | None, text: str) -> str | None:
+    """Marka z Vinted jest wiarygodna tylko, gdy to nie „bez marki”/ogólnik oraz jest na liście znanych marek
+    albo pada w tytule/opisie. Inaczej traktujemy ofertę jak no-name (żeby śmieci z pola marki nie przechodziły)."""
+    if not hint:
+        return None
+    brand = re.sub(r"\s+", " ", hint.strip().lower())
+    norm = " ".join(_norm_tokens(brand))
+    if not norm or brand in _NO_BRAND or norm in _NO_BRAND:
+        return None
+    if all(w in _GENERIC or w in _STOPWORDS for w in _words(brand)):
+        return None
+    if brand in KNOWN_BRANDS:
+        return brand
+    padded = " " + " ".join(_norm_tokens(text)) + " "
+    return brand if f" {norm} " in padded else None
+
+
 def _identify(brand_hint: str | None, title: str, description: str | None = None) -> Product | None:
-    if brand_hint and brand_hint.strip().lower() not in _NO_BRAND:
-        brand = brand_hint.strip().lower()
-    else:
-        brand = _find_known_brand(title) or _find_known_brand(description)
+    brand = (_valid_brand_hint(brand_hint, f"{title} {description or ''}")
+             or _find_known_brand(title) or _find_known_brand(description))
     if not brand:
         return None
     brand_words = set(_words(brand))
@@ -1450,7 +1474,8 @@ def _sources_text(stats: MarketStats, currency: str) -> str:
     lines = []
     for q in stats.quotes:
         url = q.url.replace("(", "%28").replace(")", "%29")
-        lines.append(f"• [{q.shop}]({url}) — **{q.price:.2f} {currency}**")
+        extra = f" (mediana z {q.offers})" if q.offers > 1 else ""
+        lines.append(f"• [{q.shop}]({url}) — **{q.price:.2f} {currency}**{extra}\n  _{_md(q.title)[:70]}_")
     return "\n".join(lines)
 
 
@@ -1472,7 +1497,7 @@ def build_discord_embed(item: Item, stats: MarketStats | None, seller: Seller, s
     details = " · ".join(x for x in (item.brand, item.details) if x)
     if details:
         embed_fields.append({"name": "🏷 Szczegóły", "value": _md(details)[:1024], "inline": False})
-    footer = f"🔎 {search_name}"
+    footer = f"🔎 {search_name} · v{__version__}"
     if stats is not None and stats.basis in ("title", "retail"):
         footer += f" · wycena {'ze sklepów' if stats.basis == 'retail' else 'z tytułu'}: „{stats.query}”"
     embed = {
@@ -1502,7 +1527,7 @@ def format_deal_text(item: Item, stats: MarketStats | None, seller: Seller, sear
                       f"  📉 {pct:.0f}% taniej")
     else:
         price_line = f"💰 {item.price:.2f} {item.currency}  (nowa oferta, bez wyceny)"
-    sources = "\n".join(f"   • {q.shop}: {q.price:.2f} {item.currency} {q.url}" for q in stats.quotes) if stats else ""
+    sources = "\n".join(f"   • {q.shop}: {q.price:.2f} {item.currency} – {q.title[:70]} {q.url}" for q in stats.quotes) if stats else ""
     return "\n".join(x for x in (
         f"{'🔥' if stats is not None else '🆕'} {item.title}",
         price_line,
@@ -1614,7 +1639,16 @@ class VintedDiscordBot(discord.Client):
         self.exit_code = 0
 
     # ------------------------------------------------------------ cykl życia
+    async def _on_app_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+        name = interaction.command.qualified_name if interaction.command else "?"
+        log.error("Błąd komendy /%s: %r", name, error, exc_info=error)
+        try:
+            await _error(interaction, f"Błąd wewnętrzny ({type(error).__name__}). Szczegóły w logu bota.")
+        except Exception:  # noqa: BLE001 – interakcja mogła już wygasnąć
+            pass
+
     async def setup_hook(self) -> None:
+        self.tree.error(self._on_app_error)
         self.tree.add_command(SearchCommands(self))
         if self.cfg.discord.guild_id:
             guild = discord.Object(id=self.cfg.discord.guild_id)
@@ -1713,9 +1747,15 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
         super().__init__()
         self.bot = bot
 
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        log.info("Discord: %s użył /%s", interaction.user,
+                 interaction.command.qualified_name if interaction.command else "?")
+        return True
+
     # --------------------------------------------------------- dodawanie
     async def _add(self, interaction: discord.Interaction, search: SearchConfig,
                    channel: discord.TextChannel | None) -> None:
+        await interaction.response.defer(thinking=True)  # od razu: Discord daje tylko 3 s na pierwszą odpowiedź
         target = channel or interaction.channel
         search.channel_id = target.id if target else None
         if problem := _check_channel(target, interaction.guild.me if interaction.guild else None):
@@ -1728,11 +1768,14 @@ class SearchCommands(app_commands.Group, name="szukaj", description="Wyszukiwani
             await _error(interaction, str(e))
             return
 
-        await interaction.response.defer(thinking=True)
         try:
             preview = await asyncio.to_thread(self.bot.preview, search)
         except VintedError as e:
             await _error(interaction, f"Vinted nie odpowiedział poprawnie: {e}\nSpróbuj ponownie za chwilę.")
+            return
+        except Exception as e:  # noqa: BLE001 – np. błąd sieci/proxy; użytkownik ma dostać odpowiedź, nie „brak odpowiedzi”
+            log.exception("Podgląd wyszukiwania %s nie powiódł się", search.name)
+            await _error(interaction, f"Nie udało się pobrać ofert z Vinted ({type(e).__name__}). Szczegóły w logu bota.")
             return
         if preview.count == 0:
             await _error(interaction, f"To wyszukiwanie nie zwraca teraz żadnych ofert – nie zapisano.\n"
@@ -2006,7 +2049,7 @@ class Bot:
                 stop_event.wait(random.uniform(*self.cfg.polling.delay_between_searches))
 
     def run_forever(self) -> None:
-        log.info("Start monitora: %d aktywnych wyszukiwań, odstęp %s–%s s", len(self.searches.active()),
+        log.info("Start monitora v" + __version__ + ": %d aktywnych wyszukiwań, odstęp %s–%s s", len(self.searches.active()),
                  self.cfg.polling.min_interval, self.cfg.polling.max_interval)
         cycles = 0
         while not stop_event.is_set():

@@ -1,6 +1,6 @@
-from vinted_bot.vinted_bot import VintedConfig
-from vinted_bot.vinted_bot import discount, robust_median
-from vinted_bot.vinted_bot import VintedClient, _parse_money
+from vinted_bot import VintedConfig
+from vinted_bot import discount, robust_median
+from vinted_bot import VintedClient, _parse_money
 
 
 def test_robust_median_drops_outliers():
@@ -48,7 +48,7 @@ def test_parse_item_new_format():
 
 
 def test_search_params_use_attribute_ids():
-    from vinted_bot.vinted_bot import SearchConfig
+    from vinted_bot import SearchConfig
     client = VintedClient(VintedConfig())
     p = client._search_params(SearchConfig(name="a", query="q", price_max=100, catalog_ids=[1242], size_ids=[784, 785],
                                            attributes={"color": [1]}), 1, 30, "newest_first", True)

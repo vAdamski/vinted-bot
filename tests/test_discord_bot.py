@@ -1,11 +1,11 @@
 import asyncio
 
-from vinted_bot.vinted_bot import load_config
+from vinted_bot import load_config
 
 
 def test_command_tree_builds(tmp_path):
     """Buduje drzewo komend bez łączenia z Discordem."""
-    from vinted_bot.vinted_bot import SearchCommands, VintedDiscordBot
+    from vinted_bot import SearchCommands, VintedDiscordBot
 
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(f"storage:\n  db_path: {tmp_path / 'db.sqlite'}\nlogging:\n  file: null\nsearches: []\n")

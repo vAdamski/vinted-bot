@@ -8,9 +8,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY vinted_bot ./vinted_bot
+COPY vinted_bot.py .
 RUN useradd --create-home --uid 1000 bot && mkdir -p /app/data && chown bot:bot /app/data
 USER bot
 
 VOLUME ["/app/data"]
-CMD ["python", "-m", "vinted_bot", "--config", "/app/config.yaml"]
+CMD ["python", "vinted_bot.py", "--config", "/app/config.yaml"]

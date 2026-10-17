@@ -1,10 +1,10 @@
 import pytest
 
-from vinted_bot.vinted_bot import ConfigError, SearchConfig, load_config
-from vinted_bot.vinted_bot import Bot
-from vinted_bot.vinted_bot import build_discord_embed
-from vinted_bot.vinted_bot import MarketStats, item_search, title_matches, title_query
-from vinted_bot.vinted_bot import Item, Seller
+from vinted_bot import ConfigError, SearchConfig, load_config
+from vinted_bot import Bot
+from vinted_bot import build_discord_embed
+from vinted_bot import MarketStats, item_search, title_matches, title_query
+from vinted_bot import Item, Seller
 
 
 def item(id_, title, price):

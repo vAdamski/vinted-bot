@@ -1,4 +1,6 @@
+
 curl_cffi>=0.7
 PyYAML>=6.0
 python-dotenv>=1.0
 discord.py>=2.5
+beautifulsoup4>=4.12
